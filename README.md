@@ -1,8 +1,88 @@
 # OmniSmart
 
-A Rust PC/SC example for the HID OMNIKEY 3021 contact smart-card reader.
-It lists connected readers, connects to the first OMNIKEY 3021, and prints
-the card protocol and ATR (Answer To Reset).
+A Rust PC/SC library and CLI for the HID OMNIKEY 3021 contact smart-card reader.
+The CLI lists connected readers, connects to the first OMNIKEY 3021, and prints
+the card protocol and ATR (Answer To Reset). The library also allows connecting
+to an explicitly selected PC/SC reader.
+
+## Using the Rust library
+
+The package builds both the `omnismart` library and the existing CLI. To use
+the local checkout from another Rust project, add a path dependency to that
+project's `Cargo.toml` (adjust the path):
+
+```toml
+[dependencies]
+omnismart = { path = 'F:\Github\omnismart' }
+```
+
+Read the ATR without sending application commands:
+
+```rust,no_run
+use omnismart::ReaderContext;
+
+fn main() -> std::io::Result<()> {
+    let context = ReaderContext::establish()?;
+    let card = context.connect_preferred()?;
+    let status = card.status()?;
+    println!("Reader: {}", status.reader);
+    println!("Protocol: {:?}", status.protocol);
+    println!("ATR: {:02X?}", status.atr);
+    Ok(())
+}
+```
+
+Public API:
+
+- `ReaderContext::readers` lists native PC/SC reader names.
+- `select_reader` implements the CLI's OMNIKEY preference/fallback policy.
+- `ReaderContext::connect` accepts an explicit reader name, including non-OMNIKEY
+  readers; `connect_preferred` discovers and selects an OMNIKEY automatically.
+- `CardConnection::status` returns owned `CardStatus` metadata.
+- `CardConnection::with_transaction` supplies a raw APDU transport closure,
+  ends exclusive access with `LeaveCard`, and preserves operation/cleanup errors.
+- `emv::parse_aid`, `read_directory`, `read_information`, and `read_dump` expose
+  the existing EMV modes. These helpers print progress; directory mode prints
+  sensitive raw responses, while information mode prints its masked table.
+- `emv::read_information_with_pan` explicitly opts in to full-PAN table output.
+  Existing decoding, structured-information, and rendering APIs remain masked.
+- `emv::read_application_information` returns a `CardInformation` struct after
+  the caller has selected an application and supplied the SELECT TLV payload.
+  It sends GPO and reads advertised standard records, and reports skipped
+  proprietary SFIs to stdout. It does not itself select an application.
+- `CardInformation::from_tlv` decodes existing EMV BER-TLV bytes without hardware
+  access or console output. Fields are public, optional, and contain no full
+  PAN or Track 2 data. `render_information` writes the table to a chosen writer.
+- `dump::Dump` records opted-in raw exchanges to a new plaintext JSON file.
+  Call `finish` explicitly on both success and read failure to persist it.
+
+For example, the existing directory reader can run inside a library-managed
+transaction:
+
+```rust,no_run
+use omnismart::{ReaderContext, emv};
+
+fn main() -> std::io::Result<()> {
+    let context = ReaderContext::establish()?;
+    let mut card = context.connect_preferred()?;
+    card.with_transaction(|transmit| emv::read_directory(transmit, None))
+}
+```
+
+The discovery/connection/status/transaction APIs do not print. Errors are
+returned as `std::io::Error`; the CLI remains responsible for displaying them
+and setting its exit code. The raw transaction transport does not filter APDUs,
+so callers must ensure their own commands are authorized and appropriate.
+
+**Card compatibility is unchanged:** a library refactor does not add support
+for proprietary RC protocols or make a card that rejects SELECT readable.
+The supplied EMV helpers are for payment applications, not vehicle-registration
+files. GPO may affect card state/counters; no helper sends PIN verification,
+writes, or payment authorization commands. Names remain personal information,
+and dumps/raw responses can contain full account data. Keep them private.
+
+Build local API documentation with `cargo doc --no-deps`. No publishing to a
+package registry is required to use the path dependency.
 
 ## Run on Windows
 
@@ -118,7 +198,26 @@ inferred from Track 2 data. The program does not guess a missing name or infer
 an issuing bank from the card network. Names may use the issuer's
 `SURNAME/FIRSTNAME` formatting.
 
-Unlike `--emv`, `--info` does not print raw APDU data, full PANs, or Track 2 contents.
+Unlike `--emv`, `--info` does not print raw APDU data or Track 2 contents.
+Full PANs are masked by default. To explicitly display the full number exposed
+by your own payment card:
+
+```powershell
+cargo run -- --info --show-pan
+# With a documented application ID:
+cargo run -- --info --aid YOUR_APPLICATION_ID_AS_HEX --show-pan
+```
+
+`--show-pan` is accepted only with `--info`; it may appear before or after
+`--aid HEX`. It prints a warning and labels the table field **Card number (full)**.
+Only tag `5A` is used; no PAN is inferred from Track 2 or reconstructed from a
+masked number. Missing PANs are marked **Not provided**. The flag sends no
+additional card commands, bypasses no access controls, and does not affect raw
+dump behavior. It does not add vehicle-registration-card support.
+
+**Sensitive output:** Do not share, log, commit, or redirect full-PAN output to
+an insecure location. Omit the flag to retain normal masking.
+
 The name itself is personal information: do not share output without reviewing
 it. Application records can contain account data; the tool reads them locally
 in memory and displays only the general-information fields listed above.

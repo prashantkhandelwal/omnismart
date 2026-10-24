@@ -1,5 +1,16 @@
+//! EMV directory, information, and readable-record helpers.
+//!
+//! Reading functions accept an APDU transport closure, so they work with
+//! [`crate::CardConnection::with_transaction`] or a synthetic transport.
+//! [`read_directory`], [`read_information`], [`read_information_with_pan`], and
+//! [`read_dump`] print progress;
+//! directory mode also prints sensitive raw responses. For structured data, use
+//! [`read_application_information`] after selecting a documented application, or
+//! decode existing TLV bytes with [`CardInformation::from_tlv`].
+
 use std::io::{self, Write};
 
+/// Parses a 5-to-16-byte application ID encoded as hex without separators.
 pub fn parse_aid(value: &str) -> io::Result<Vec<u8>> {
     if !(10..=32).contains(&value.len())
         || !value.len().is_multiple_of(2)
@@ -175,6 +186,9 @@ fn add_aids(data: &[u8], aids: &mut Vec<Vec<u8>>) -> io::Result<()> {
     Ok(())
 }
 
+/// Discovers/selects payment applications and prints raw commands and responses.
+///
+/// Does not send GPO. Responses can contain sensitive card data.
 pub fn read_directory(
     mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     explicit_aid: Option<&[u8]>,
@@ -191,6 +205,10 @@ pub fn read_directory(
     )
 }
 
+/// Discovers applications and prints a masked general-information table.
+///
+/// Sends GPO and reads advertised standard records. GPO may affect card counters.
+/// Only absent/empty PDOLs are supported; no PIN or payment authorization is sent.
 pub fn read_information(
     transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     explicit_aid: Option<&[u8]>,
@@ -198,6 +216,22 @@ pub fn read_information(
     read_applications(transmit, explicit_aid, ReadMode::Information)
 }
 
+/// Explicitly opts in to printing the full PAN returned in EMV tag 5A.
+///
+/// Otherwise behaves like [`read_information`]. Keep output private; this cannot
+/// reconstruct a masked/missing PAN and does not decode PANs from Track 2.
+pub fn read_information_with_pan(
+    transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    explicit_aid: Option<&[u8]>,
+) -> io::Result<()> {
+    read_applications(transmit, explicit_aid, ReadMode::InformationWithPan)
+}
+
+/// Reads directory, GPO, and AFL-advertised records through the supplied transport.
+///
+/// Wrap the transport with [`crate::dump::Dump::exchange`] to persist exchanges.
+/// This prints progress, not raw responses, and is not a full-memory dump.
+/// Like [`read_information`], this sends GPO and requires an absent/empty PDOL.
 pub fn read_dump(
     transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     explicit_aid: Option<&[u8]>,
@@ -209,6 +243,7 @@ pub fn read_dump(
 enum ReadMode {
     Directory,
     Information,
+    InformationWithPan,
     Dump,
 }
 
@@ -219,6 +254,12 @@ fn read_applications(
 ) -> io::Result<()> {
     let mut aids = Vec::new();
     if let Some(aid) = explicit_aid {
+        if !(5..=16).contains(&aid.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "An AID must contain 5 to 16 bytes.",
+            ));
+        }
         aids.push(aid.to_vec());
     } else {
         println!("Selecting contact payment directory (1PAY.SYS.DDF01).");
@@ -273,9 +314,19 @@ fn read_applications(
             let response = select(&mut transmit, &aid)?;
             require_success(&response, "Application SELECT")?;
             match mode {
-                ReadMode::Information => {
-                    let info = read_application_information(&mut transmit, &response.data)?;
-                    info.render_information(&aid, &mut io::stdout().lock())?;
+                ReadMode::Information | ReadMode::InformationWithPan => {
+                    let show_pan = mode == ReadMode::InformationWithPan;
+                    let (info, full_pan) = read_application_information_inner(
+                        &mut transmit,
+                        &response.data,
+                        show_pan,
+                    )?;
+                    info.render_information_inner(
+                        &aid,
+                        &mut io::stdout().lock(),
+                        show_pan,
+                        full_pan.as_deref(),
+                    )?;
                 }
                 ReadMode::Dump => dump_application_records(&mut transmit, &response.data)?,
                 ReadMode::Directory => {}
@@ -305,21 +356,25 @@ fn read_applications(
     Ok(())
 }
 
-#[derive(Default, Debug, PartialEq)]
-struct CardInformation {
-    name: Option<String>,
-    label: Option<String>,
-    language: Option<String>,
-    priority: Option<u8>,
-    country: Option<String>,
-    currency: Option<String>,
-    masked_pan: Option<String>,
-    expiry: Option<String>,
-    effective: Option<String>,
-    currency_exponent: Option<String>,
-    sequence: Option<String>,
-    service_code: Option<String>,
-    version: Option<String>,
+/// Decoded EMV information, excluding full PAN and Track 2 data.
+///
+/// Missing tags remain `None`. Names are personal data even when PAN is masked.
+/// Country/currency are numeric codes, dates use `20YY-MM-DD`, and version is hex.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct CardInformation {
+    pub name: Option<String>,
+    pub label: Option<String>,
+    pub language: Option<String>,
+    pub priority: Option<u8>,
+    pub country: Option<String>,
+    pub currency: Option<String>,
+    pub masked_pan: Option<String>,
+    pub expiry: Option<String>,
+    pub effective: Option<String>,
+    pub currency_exponent: Option<String>,
+    pub sequence: Option<String>,
+    pub service_code: Option<String>,
+    pub version: Option<String>,
 }
 
 fn text_field(data: &[u8], tag: u32) -> io::Result<Option<String>> {
@@ -392,7 +447,7 @@ fn date_field(data: &[u8], tag: u32) -> io::Result<Option<String>> {
         .transpose()
 }
 
-fn masked_pan(data: &[u8]) -> io::Result<Option<String>> {
+fn pan(data: &[u8]) -> io::Result<Option<String>> {
     find_tags(data, 0x5A)?
         .first()
         .map(|value| {
@@ -408,13 +463,31 @@ fn masked_pan(data: &[u8]) -> io::Result<Option<String>> {
             {
                 return Err(invalid("Invalid PAN encoding."));
             }
-            let suffix = &digits[digits.len() - 4..];
-            Ok(format!("{} {suffix}", "*".repeat(digits.len() - 4)))
+            Ok(digits)
         })
         .transpose()
 }
 
+fn masked_pan(data: &[u8]) -> io::Result<Option<String>> {
+    pan(data).map(|pan| {
+        pan.map(|digits| {
+            let suffix = &digits[digits.len() - 4..];
+            format!("{} {suffix}", "*".repeat(digits.len() - 4))
+        })
+    })
+}
+
 impl CardInformation {
+    /// Decodes BER-TLV data without accessing hardware or printing output.
+    ///
+    /// Supply the TLV payload only, without APDU status bytes. This is not a
+    /// decoder for SCOSTA RC simple-TLV files or arbitrary card memory.
+    pub fn from_tlv(data: &[u8]) -> io::Result<Self> {
+        let mut information = Self::default();
+        information.update(data)?;
+        Ok(information)
+    }
+
     fn update(&mut self, data: &[u8]) -> io::Result<()> {
         for (field, tag) in [
             (&mut self.name, 0x5F20),
@@ -480,7 +553,20 @@ impl CardInformation {
         Ok(())
     }
 
-    fn render_information(&self, aid: &[u8], output: &mut impl Write) -> io::Result<()> {
+    /// Writes the CLI's masked table to a caller-provided writer.
+    ///
+    /// The AID is used only to label recognized payment networks.
+    pub fn render_information(&self, aid: &[u8], output: &mut impl Write) -> io::Result<()> {
+        self.render_information_inner(aid, output, false, None)
+    }
+
+    fn render_information_inner(
+        &self,
+        aid: &[u8],
+        output: &mut impl Write,
+        show_pan: bool,
+        full_pan: Option<&str>,
+    ) -> io::Result<()> {
         let network = if aid.starts_with(&[0xA0, 0, 0, 0, 3]) {
             "Visa"
         } else if aid.starts_with(&[0xA0, 0, 0, 0, 4]) {
@@ -518,7 +604,14 @@ impl CardInformation {
                     .clone()
                     .unwrap_or_else(|| "Not exposed in the standard records read".to_owned()),
             ),
-            ("Card number (masked)", value(&self.masked_pan)),
+            if show_pan {
+                (
+                    "Card number (full)",
+                    full_pan.unwrap_or("Not provided").to_owned(),
+                )
+            } else {
+                ("Card number (masked)", value(&self.masked_pan))
+            },
             ("Application expiry date", value(&self.expiry)),
             ("Application effective date", value(&self.effective)),
             ("Issuer country", country.to_owned()),
@@ -545,10 +638,17 @@ impl CardInformation {
             writeln!(output, "| {label:<27} | {value:<width$} |")?;
         }
         writeln!(output, "{border}")?;
-        writeln!(
-            output,
-            "Full PAN, Track 2 data, and raw application records are not displayed."
-        )
+        if show_pan {
+            writeln!(
+                output,
+                "Full PAN display enabled. Keep output private. Track 2 and raw records are not displayed."
+            )
+        } else {
+            writeln!(
+                output,
+                "Full PAN, Track 2 data, and raw application records are not displayed."
+            )
+        }
     }
 }
 
@@ -613,16 +713,38 @@ fn application_records_including(
     Ok(records)
 }
 
-fn read_application_information(
+/// Returns structured information for an application already selected by the caller.
+///
+/// `selection` is the SELECT response's TLV payload, excluding SW1/SW2.
+/// Sends GPO and reads advertised standard records; required PDOLs are unsupported.
+/// Raw account data is not printed, but skipped proprietary SFIs are reported.
+pub fn read_application_information(
     transmit: &mut impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     selection: &[u8],
 ) -> io::Result<CardInformation> {
+    read_application_information_inner(transmit, selection, false)
+        .map(|(information, _)| information)
+}
+
+fn read_application_information_inner(
+    transmit: &mut impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    selection: &[u8],
+    show_pan: bool,
+) -> io::Result<(CardInformation, Option<String>)> {
     let mut info = CardInformation::default();
-    info.update(selection)?;
+    let mut full_pan = None;
+    let mut update = |data: &[u8]| -> io::Result<()> {
+        info.update(data)?;
+        if show_pan && full_pan.is_none() {
+            full_pan = pan(data)?;
+        }
+        Ok(())
+    };
+    update(selection)?;
     let response = processing_options(transmit, selection)?;
     // Template 80 is a primitive AIP/AFL layout, not nested TLV.
     if !find_tags(&response.data, 0x77)?.is_empty() {
-        info.update(&response.data)?;
+        update(&response.data)?;
     }
     for (sfi, record) in application_records(&response.data)? {
         let response = exchange(transmit, &[0x00, 0xB2, record, (sfi << 3) | 0x04, 0x00])?;
@@ -633,9 +755,9 @@ fn read_application_information(
                 "Standard EMV record requires a single 70 template.",
             ));
         }
-        info.update(templates[0])?;
+        update(templates[0])?;
     }
-    Ok(info)
+    Ok((info, full_pan))
 }
 
 fn processing_options(
@@ -1144,6 +1266,14 @@ mod tests {
     #[test]
     fn handles_padded_pan_and_rejects_invalid_encodings() {
         assert_eq!(
+            pan(&[
+                0x5A, 10, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x9F,
+            ])
+            .unwrap()
+            .as_deref(),
+            Some("1234567890123456789")
+        );
+        assert_eq!(
             masked_pan(&[
                 0x5A, 10, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x9F,
             ])
@@ -1157,6 +1287,7 @@ mod tests {
             vec![0x5A, 4, 0x12, 0x34, 0x56, 0x7A],
         ] {
             assert!(masked_pan(&data).is_err());
+            assert!(pan(&data).is_err());
         }
         for data in [
             vec![0x9F, 0x44, 1, 0x10],
@@ -1164,6 +1295,90 @@ mod tests {
             vec![0x9F, 0x08, 1, 0x96],
         ] {
             assert!(CardInformation::default().update(&data).is_err());
+        }
+    }
+
+    #[test]
+    fn full_pan_is_collected_and_rendered_only_after_explicit_opt_in() {
+        let pan_tlv = [0x5A, 8, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56];
+        for source in 0..3 {
+            for show_pan in [false, true] {
+                let selection = if source == 0 { &pan_tlv[..] } else { &[] };
+                let mut gpo_data = vec![0x82, 2, 0, 0, 0x94, 4, 8, 1, 1, 0];
+                if source == 1 {
+                    gpo_data.extend_from_slice(&pan_tlv);
+                }
+                let mut gpo = vec![0x77, gpo_data.len() as u8];
+                gpo.extend_from_slice(&gpo_data);
+                gpo.extend_from_slice(&[0x90, 0]);
+                let mut record = if source == 2 {
+                    [vec![0x70, pan_tlv.len() as u8], pan_tlv.to_vec()].concat()
+                } else {
+                    vec![0x70, 0]
+                };
+                record.extend_from_slice(&[0x90, 0]);
+                let mut responses = vec![gpo, record].into_iter();
+                let mut commands = Vec::new();
+                let (info, full_pan) = read_application_information_inner(
+                    &mut |command| {
+                        commands.push(command.to_vec());
+                        Ok(responses.next().unwrap())
+                    },
+                    selection,
+                    show_pan,
+                )
+                .unwrap();
+                assert_eq!(
+                    commands,
+                    [
+                        vec![0x80, 0xA8, 0, 0, 2, 0x83, 0, 0],
+                        vec![0, 0xB2, 1, 0x0C, 0],
+                    ]
+                );
+                assert_eq!(info.masked_pan.as_deref(), Some("************ 3456"));
+                assert!(!format!("{info:?}").contains("1234567890123456"));
+                assert_eq!(full_pan.as_deref(), show_pan.then_some("1234567890123456"));
+                let mut output = Vec::new();
+                info.render_information_inner(&[], &mut output, show_pan, full_pan.as_deref())
+                    .unwrap();
+                let output = String::from_utf8(output).unwrap();
+                assert_eq!(output.contains("1234567890123456"), show_pan);
+                assert_eq!(output.contains("Card number (full)"), show_pan);
+                assert_eq!(output.contains("Card number (masked)"), !show_pan);
+                assert_eq!(
+                    output.contains(
+                        "Full PAN, Track 2 data, and raw application records are not displayed."
+                    ),
+                    !show_pan
+                );
+                let mut masked_output = Vec::new();
+                info.render_information(&[], &mut masked_output).unwrap();
+                assert!(
+                    !String::from_utf8(masked_output)
+                        .unwrap()
+                        .contains("1234567890123456")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_pan_mode_does_not_invent_a_missing_pan_or_decode_track_two() {
+        for selection in [&[][..], &[0x57, 4, 0x12, 0x34, 0x56, 0x78][..]] {
+            let (info, full_pan) = read_application_information_inner(
+                &mut |_| Ok(vec![0x80, 2, 0, 0, 0x90, 0]),
+                selection,
+                true,
+            )
+            .unwrap();
+            assert_eq!(full_pan, None);
+            let mut output = Vec::new();
+            info.render_information_inner(&[], &mut output, true, full_pan.as_deref())
+                .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("Card number (full)"));
+            assert!(output.contains("Not provided"));
+            assert!(!output.contains("12345678"));
         }
     }
 

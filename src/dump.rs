@@ -1,3 +1,8 @@
+//! Explicitly opted-in plaintext JSON exchange recording.
+//!
+//! Dumps may contain names, full PANs, expiry, and Track 2 data. Keep them local,
+//! outside source control, and call [`Dump::finish`] on both success and failure.
+
 use serde::Serialize;
 use std::{
     fs::{File, OpenOptions},
@@ -27,6 +32,9 @@ struct Report {
     exchanges: Vec<Exchange>,
 }
 
+/// Collects raw exchanges and writes them when explicitly finished.
+///
+/// Dropping this value without calling [`Self::finish`] leaves an empty file.
 pub struct Dump {
     file: File,
     report: Report,
@@ -37,6 +45,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 impl Dump {
+    /// Creates a new destination; existing files are never overwritten.
+    ///
+    /// The plaintext file inherits its destination directory's access permissions.
     pub fn create(path: &Path, reader: &str, protocol: String, atr: &[u8]) -> io::Result<Self> {
         let created_unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -74,9 +85,10 @@ impl Dump {
         })
     }
 
+    /// Records a raw command and its response or transport error.
     pub fn exchange(
         &mut self,
-        transmit: &mut impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+        transmit: &mut (impl FnMut(&[u8]) -> io::Result<Vec<u8>> + ?Sized),
         command: &[u8],
     ) -> io::Result<Vec<u8>> {
         let response = transmit(command);
@@ -88,6 +100,9 @@ impl Dump {
         response
     }
 
+    /// Writes and flushes the report, preserving partial exchanges on read failure.
+    ///
+    /// Pass the reading operation's error to mark an incomplete report.
     pub fn finish(mut self, error: Option<&io::Error>) -> io::Result<()> {
         self.report.complete = error.is_none();
         self.report.error = error.map(ToString::to_string);
