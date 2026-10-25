@@ -207,6 +207,8 @@ pub fn read_directory(
 
 /// Discovers applications and prints a masked general-information table.
 ///
+/// Each application gets its own table labeled with its AID, even when the
+/// recovered card details match another application's.
 /// Sends GPO and reads advertised standard records. GPO may affect card counters.
 /// Only absent/empty PDOLs are supported; no PIN or payment authorization is sent.
 pub fn read_information(
@@ -225,6 +227,55 @@ pub fn read_information_with_pan(
     explicit_aid: Option<&[u8]>,
 ) -> io::Result<()> {
     read_applications(transmit, explicit_aid, ReadMode::InformationWithPan)
+}
+
+/// Explicitly reads an unmasked PAN from a documented payment application.
+///
+/// Selects `aid`, sends GPO, and reads advertised standard records without
+/// printing anything. The same absent/empty-PDOL restriction as
+/// [`read_information`] applies. GPO may affect card state/counters.
+///
+/// Returns `None` if tag 5A is absent. Does not infer a PAN from Track 2 or bypass
+/// access controls. The returned string is sensitive: do not log or upload it.
+pub fn read_pan(
+    mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    aid: &[u8],
+) -> io::Result<Option<String>> {
+    validate_aid(aid)?;
+    let selection = select(&mut transmit, aid)?;
+    require_success(&selection, "Application SELECT")?;
+    let (_, pan) = read_application_information_inner(&mut transmit, &selection.data, true, false)?;
+    Ok(pan)
+}
+
+/// Discovers payment applications and returns the first PAN exposed in tag 5A.
+///
+/// Uses the contact payment directory, falling back to the contactless directory
+/// only when the first is absent. Does not print or guess AIDs. If neither
+/// directory is available, supply a documented AID to [`read_pan`] instead.
+///
+/// Returns `None` if all discovered applications omit the PAN. Any directory,
+/// application, or transport error stops reading. Like [`read_pan`], this sends
+/// GPO, requires absent/empty PDOLs, and returns sensitive unmasked data.
+pub fn read_pan_auto(
+    mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+) -> io::Result<Option<String>> {
+    for aid in discover_aids(&mut transmit, false)? {
+        if let Some(pan) = read_pan(&mut transmit, &aid)? {
+            return Ok(Some(pan));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_aid(aid: &[u8]) -> io::Result<()> {
+    if !(5..=16).contains(&aid.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "An AID must contain 5 to 16 bytes.",
+        ));
+    }
+    Ok(())
 }
 
 /// Reads directory, GPO, and AFL-advertised records through the supplied transport.
@@ -247,59 +298,51 @@ enum ReadMode {
     Dump,
 }
 
-fn read_applications(
-    mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
-    explicit_aid: Option<&[u8]>,
-    mode: ReadMode,
-) -> io::Result<()> {
+fn discover_aids(
+    transmit: &mut impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    report_progress: bool,
+) -> io::Result<Vec<Vec<u8>>> {
     let mut aids = Vec::new();
-    if let Some(aid) = explicit_aid {
-        if !(5..=16).contains(&aid.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "An AID must contain 5 to 16 bytes.",
-            ));
-        }
-        aids.push(aid.to_vec());
-    } else {
+    if report_progress {
         println!("Selecting contact payment directory (1PAY.SYS.DDF01).");
-        let mut directory = select(&mut transmit, b"1PAY.SYS.DDF01")?;
-        if directory.status == [0x6A, 0x82] {
+    }
+    let mut directory = select(transmit, b"1PAY.SYS.DDF01")?;
+    if directory.status == [0x6A, 0x82] {
+        if report_progress {
             println!("Contact directory absent; trying 2PAY.SYS.DDF01.");
-            directory = select(&mut transmit, b"2PAY.SYS.DDF01")?;
         }
-        if directory.status == [0x6A, 0x82] {
-            return Err(io::Error::other(
-                "Neither payment directory is available. If you know the card's documented \
-                 application ID, use --aid HEX with your chosen reading mode.",
-            ));
+        directory = select(transmit, b"2PAY.SYS.DDF01")?;
+    }
+    if directory.status == [0x6A, 0x82] {
+        return Err(io::Error::other(
+            "Neither payment directory is available. If you know the card's documented \
+             application ID, use --aid HEX with your chosen reading mode.",
+        ));
+    }
+    require_success(&directory, "Directory SELECT")?;
+    add_aids(&directory.data, &mut aids)?;
+    let sfis = find_tags(&directory.data, 0x88)?;
+    if let Some(sfi) = sfis.first() {
+        if sfi.len() != 1 || !(1..=30).contains(&sfi[0]) {
+            return Err(invalid("Invalid directory short file identifier."));
         }
-        require_success(&directory, "Directory SELECT")?;
-        add_aids(&directory.data, &mut aids)?;
-        let sfis = find_tags(&directory.data, 0x88)?;
-        if let Some(sfi) = sfis.first() {
-            if sfi.len() != 1 || !(1..=30).contains(&sfi[0]) {
-                return Err(invalid("Invalid directory short file identifier."));
-            }
-            let mut finished = false;
-            for record in 1..=u8::MAX {
+        let mut finished = false;
+        for record in 1..=u8::MAX {
+            if report_progress {
                 println!("Reading directory record {record} (SFI {}).", sfi[0]);
-                let response = exchange(
-                    &mut transmit,
-                    &[0x00, 0xB2, record, (sfi[0] << 3) | 0x04, 0x00],
-                )?;
-                if response.status == [0x6A, 0x83] {
-                    finished = true;
-                    break;
-                }
-                require_success(&response, "Directory READ RECORD")?;
-                add_aids(&response.data, &mut aids)?;
             }
-            if !finished {
-                return Err(invalid(
-                    "Directory record limit reached without an end marker.",
-                ));
+            let response = exchange(transmit, &[0x00, 0xB2, record, (sfi[0] << 3) | 0x04, 0x00])?;
+            if response.status == [0x6A, 0x83] {
+                finished = true;
+                break;
             }
+            require_success(&response, "Directory READ RECORD")?;
+            add_aids(&response.data, &mut aids)?;
+        }
+        if !finished {
+            return Err(invalid(
+                "Directory record limit reached without an end marker.",
+            ));
         }
     }
     if aids.is_empty() {
@@ -307,6 +350,20 @@ fn read_applications(
             "No application IDs found. Use --aid HEX with a documented AID.",
         ));
     }
+    Ok(aids)
+}
+
+fn read_applications(
+    mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    explicit_aid: Option<&[u8]>,
+    mode: ReadMode,
+) -> io::Result<()> {
+    let aids = if let Some(aid) = explicit_aid {
+        validate_aid(aid)?;
+        vec![aid.to_vec()]
+    } else {
+        discover_aids(&mut transmit, true)?
+    };
     let mut errors = Vec::new();
     for aid in aids {
         print_hex("Selecting application AID:", &aid);
@@ -320,6 +377,7 @@ fn read_applications(
                         &mut transmit,
                         &response.data,
                         show_pan,
+                        true,
                     )?;
                     info.render_information_inner(
                         &aid,
@@ -555,7 +613,7 @@ impl CardInformation {
 
     /// Writes the CLI's masked table to a caller-provided writer.
     ///
-    /// The AID is used only to label recognized payment networks.
+    /// The AID identifies the application in the table and labels recognized networks.
     pub fn render_information(&self, aid: &[u8], output: &mut impl Write) -> io::Result<()> {
         self.render_information_inner(aid, output, false, None)
     }
@@ -595,7 +653,16 @@ impl CardInformation {
         };
         let value =
             |field: &Option<String>| field.clone().unwrap_or_else(|| "Not provided".to_owned());
+        let application_aid = if aid.is_empty() {
+            "Not provided".to_owned()
+        } else {
+            aid.iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let rows = [
+            ("Application AID", application_aid),
             ("Network", network.to_owned()),
             ("Application label", value(&self.label)),
             (
@@ -660,6 +727,14 @@ fn application_records_including(
     data: &[u8],
     include_proprietary: bool,
 ) -> io::Result<Vec<(u8, u8)>> {
+    application_records_with_logging(data, include_proprietary, true)
+}
+
+fn application_records_with_logging(
+    data: &[u8],
+    include_proprietary: bool,
+    report_skipped: bool,
+) -> io::Result<Vec<(u8, u8)>> {
     let format_one = find_tags(data, 0x80)?;
     let afl = if let Some(value) = format_one.first() {
         if value.len() < 2 {
@@ -698,7 +773,11 @@ fn application_records_including(
             return Err(invalid("Invalid Application File Locator entry."));
         }
         if sfi > 10 && !include_proprietary {
-            println!("Skipping proprietary SFI {sfi}; only standard EMV TLV records are decoded.");
+            if report_skipped {
+                println!(
+                    "Skipping proprietary SFI {sfi}; only standard EMV TLV records are decoded."
+                );
+            }
             continue;
         }
         for record in first..=last {
@@ -722,7 +801,7 @@ pub fn read_application_information(
     transmit: &mut impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     selection: &[u8],
 ) -> io::Result<CardInformation> {
-    read_application_information_inner(transmit, selection, false)
+    read_application_information_inner(transmit, selection, false, true)
         .map(|(information, _)| information)
 }
 
@@ -730,6 +809,7 @@ fn read_application_information_inner(
     transmit: &mut impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     selection: &[u8],
     show_pan: bool,
+    report_skipped: bool,
 ) -> io::Result<(CardInformation, Option<String>)> {
     let mut info = CardInformation::default();
     let mut full_pan = None;
@@ -746,7 +826,12 @@ fn read_application_information_inner(
     if !find_tags(&response.data, 0x77)?.is_empty() {
         update(&response.data)?;
     }
-    for (sfi, record) in application_records(&response.data)? {
+    let records = if report_skipped {
+        application_records(&response.data)?
+    } else {
+        application_records_with_logging(&response.data, false, false)?
+    };
+    for (sfi, record) in records {
         let response = exchange(transmit, &[0x00, 0xB2, record, (sfi << 3) | 0x04, 0x00])?;
         require_success(&response, "Application READ RECORD")?;
         let templates = find_tags(&response.data, 0x70)?;
@@ -1193,6 +1278,8 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         for expected in [
             "Information recovered",
+            "Application AID",
+            "A0 00 00 00 03 10 10",
             "Visa",
             "TEST",
             "DOE/JANE",
@@ -1220,8 +1307,52 @@ mod tests {
             .filter(|line| line.starts_with('|'))
             .map(str::len)
             .collect();
-        assert_eq!(widths.len(), 15);
+        assert_eq!(widths.len(), 16);
         assert!(widths.iter().all(|width| *width == widths[0]));
+    }
+
+    #[test]
+    fn labels_matching_application_tables_in_both_information_modes() {
+        let info = CardInformation::from_tlv(&[
+            0x50, 4, b'T', b'E', b'S', b'T', 0x5A, 4, 0x12, 0x34, 0x56, 0x78,
+        ])
+        .unwrap();
+        let aids = [
+            vec![0xA0, 0, 0, 0, 0x25, 1, 8, 1],
+            vec![0xA0, 0, 0, 0, 0x29, 0x10, 0x10],
+            vec![0xAB; 16],
+        ];
+        for show_pan in [false, true] {
+            let mut output = Vec::new();
+            for aid in &aids {
+                info.render_information_inner(
+                    aid,
+                    &mut output,
+                    show_pan,
+                    show_pan.then_some("12345678"),
+                )
+                .unwrap();
+            }
+            let output = String::from_utf8(output).unwrap();
+            let tables: Vec<_> = output.split("\nInformation recovered\n").skip(1).collect();
+            assert_eq!(tables.len(), 3);
+            for (table, expected_aid) in tables.iter().zip([
+                "A0 00 00 00 25 01 08 01",
+                "A0 00 00 00 29 10 10",
+                "AB AB AB AB AB AB AB AB AB AB AB AB AB AB AB AB",
+            ]) {
+                assert!(table.contains(&format!("| Application AID             | {expected_aid}")));
+                assert!(table.contains("TEST"));
+                assert_eq!(table.contains("12345678"), show_pan);
+                assert_eq!(table.contains("**** 5678"), !show_pan);
+                let widths: Vec<_> = table
+                    .lines()
+                    .filter(|line| line.starts_with('|') || line.starts_with('+'))
+                    .map(str::len)
+                    .collect();
+                assert!(widths.iter().all(|width| *width == widths[0]));
+            }
+        }
     }
 
     #[test]
@@ -1326,6 +1457,7 @@ mod tests {
                     },
                     selection,
                     show_pan,
+                    true,
                 )
                 .unwrap();
                 assert_eq!(
@@ -1368,6 +1500,7 @@ mod tests {
             let (info, full_pan) = read_application_information_inner(
                 &mut |_| Ok(vec![0x80, 2, 0, 0, 0x90, 0]),
                 selection,
+                true,
                 true,
             )
             .unwrap();

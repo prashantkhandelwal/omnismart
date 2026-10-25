@@ -125,3 +125,142 @@ fn dump_transport_accepts_a_trait_object() {
     assert_eq!(report["exchanges"][0]["response_hex"], "9000");
     std::fs::remove_file(&path).unwrap();
 }
+
+#[test]
+fn pan_reader_returns_only_pan_and_skips_proprietary_records() {
+    let mut responses = vec![
+        vec![0x6F, 0, 0x90, 0],
+        vec![0x80, 10, 0, 0, 8, 1, 1, 0, 88, 1, 1, 0, 0x90, 0],
+        vec![0x70, 6, 0x5A, 4, 0x12, 0x34, 0x56, 0x78, 0x90, 0],
+    ]
+    .into_iter();
+    let mut commands = Vec::new();
+    let pan = emv::read_pan(
+        |command| {
+            commands.push(command.to_vec());
+            Ok(responses.next().unwrap())
+        },
+        &[0xA0, 0, 0, 0, 3],
+    )
+    .unwrap();
+    assert_eq!(pan.as_deref(), Some("12345678"));
+    assert_eq!(commands.len(), 3);
+    assert_eq!(commands[2], [0, 0xB2, 1, 0x0C, 0]);
+    assert!(responses.next().is_none());
+}
+
+#[test]
+fn pan_reader_distinguishes_missing_pan_from_card_errors() {
+    let mut responses = vec![vec![0x6F, 0, 0x90, 0], vec![0x80, 2, 0, 0, 0x90, 0]].into_iter();
+    assert_eq!(
+        emv::read_pan(|_| Ok(responses.next().unwrap()), &[0xA0, 0, 0, 0, 3]).unwrap(),
+        None
+    );
+    assert!(emv::read_pan(|_| Ok(vec![0x69, 0x82]), &[0xA0, 0, 0, 0, 3]).is_err());
+    let mut calls = 0;
+    assert_eq!(
+        emv::read_pan(
+            |_| {
+                calls += 1;
+                Ok(vec![0x90, 0])
+            },
+            &[0; 4],
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(calls, 0);
+}
+
+#[test]
+fn automatic_pan_reader_discovers_aid_from_directory_records() {
+    let mut responses = vec![
+        vec![0x6F, 3, 0x88, 1, 1, 0x90, 0],
+        vec![0x70, 7, 0x4F, 5, 0xA0, 0, 0, 0, 3, 0x90, 0],
+        vec![0x6A, 0x83],
+        vec![0x6F, 6, 0x5A, 4, 0x12, 0x34, 0x56, 0x78, 0x90, 0],
+        vec![0x80, 2, 0, 0, 0x90, 0],
+    ]
+    .into_iter();
+    let mut commands = Vec::new();
+    let pan = emv::read_pan_auto(|command| {
+        commands.push(command.to_vec());
+        Ok(responses.next().unwrap())
+    })
+    .unwrap();
+    assert_eq!(pan.as_deref(), Some("12345678"));
+    assert_eq!(&commands[0][5..19], b"1PAY.SYS.DDF01");
+    assert_eq!(commands[1], [0, 0xB2, 1, 0x0C, 0]);
+    assert_eq!(commands[2], [0, 0xB2, 2, 0x0C, 0]);
+    assert_eq!(commands[3], [0, 0xA4, 4, 0, 5, 0xA0, 0, 0, 0, 3, 0]);
+    assert_eq!(commands.len(), 5);
+}
+
+#[test]
+fn automatic_pan_reader_falls_back_and_tries_next_app_when_pan_is_missing() {
+    let mut responses = vec![
+        vec![0x6A, 0x82],
+        vec![
+            0x6F, 14, 0x4F, 5, 0xA0, 0, 0, 0, 3, 0x4F, 5, 0xA0, 0, 0, 0, 4, 0x90, 0,
+        ],
+        vec![0x6F, 0, 0x90, 0],
+        vec![0x80, 2, 0, 0, 0x90, 0],
+        vec![0x6F, 6, 0x5A, 4, 0x12, 0x34, 0x56, 0x78, 0x90, 0],
+        vec![0x80, 2, 0, 0, 0x90, 0],
+    ]
+    .into_iter();
+    let mut commands = Vec::new();
+    let pan = emv::read_pan_auto(|command| {
+        commands.push(command.to_vec());
+        Ok(responses.next().unwrap())
+    })
+    .unwrap();
+    assert_eq!(pan.as_deref(), Some("12345678"));
+    assert_eq!(&commands[1][5..19], b"2PAY.SYS.DDF01");
+    assert_eq!(&commands[2][5..10], &[0xA0, 0, 0, 0, 3]);
+    assert_eq!(&commands[4][5..10], &[0xA0, 0, 0, 0, 4]);
+    assert_eq!(commands.len(), 6);
+}
+
+#[test]
+fn automatic_pan_reader_reports_missing_pan_without_guessing_other_aids() {
+    let mut responses = vec![
+        vec![0x6F, 7, 0x4F, 5, 0xA0, 0, 0, 0, 3, 0x90, 0],
+        vec![0x6F, 0, 0x90, 0],
+        vec![0x80, 2, 0, 0, 0x90, 0],
+    ]
+    .into_iter();
+    assert_eq!(
+        emv::read_pan_auto(|_| Ok(responses.next().unwrap())).unwrap(),
+        None
+    );
+    assert!(responses.next().is_none());
+}
+
+#[test]
+fn automatic_pan_reader_stops_on_directory_and_application_errors() {
+    for (responses, expected_calls) in [
+        (vec![vec![0x6D, 0]], 1),
+        (vec![vec![0x6A, 0x82], vec![0x6A, 0x82]], 2),
+        (vec![vec![0x6F, 0, 0x90, 0]], 1),
+        (
+            vec![
+                vec![0x6F, 7, 0x4F, 5, 0xA0, 0, 0, 0, 3, 0x90, 0],
+                vec![0x69, 0x82],
+            ],
+            2,
+        ),
+    ] {
+        let mut responses = responses.into_iter();
+        let mut calls = 0;
+        assert!(
+            emv::read_pan_auto(|_| {
+                calls += 1;
+                Ok(responses.next().unwrap())
+            })
+            .is_err()
+        );
+        assert_eq!(calls, expected_calls);
+    }
+}

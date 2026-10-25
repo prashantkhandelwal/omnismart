@@ -46,6 +46,11 @@ Public API:
   sensitive raw responses, while information mode prints its masked table.
 - `emv::read_information_with_pan` explicitly opts in to full-PAN table output.
   Existing decoding, structured-information, and rendering APIs remain masked.
+- `emv::read_pan` explicitly returns an unmasked `Option<String>` for a
+  documented AID without console output. `None` means tag `5A` was not provided;
+  card/transport/decoding failures remain errors.
+- `emv::read_pan_auto` discovers AIDs from the payment directory and returns
+  the first available PAN without printing. It does not guess application IDs.
 - `emv::read_application_information` returns a `CardInformation` struct after
   the caller has selected an application and supplied the SELECT TLV payload.
   It sends GPO and reads advertised standard records, and reports skipped
@@ -83,6 +88,28 @@ and dumps/raw responses can contain full account data. Keep them private.
 
 Build local API documentation with `cargo doc --no-deps`. No publishing to a
 package registry is required to use the path dependency.
+
+### Print only the PAN in Rust
+
+The runnable [print_pan example](examples/print_pan.rs) discovers the AID
+automatically when no argument is supplied:
+
+```powershell
+cargo run --quiet --example print_pan
+# Optional: use your own card's documented application ID directly:
+cargo run --quiet --example print_pan -- YOUR_DOCUMENTED_AID_HEX
+```
+
+Automatic mode uses `emv::read_pan_auto` to discover applications from the
+contact payment directory, falling back to the contactless directory only
+if the first is absent. It returns the first PAN provided by the advertised
+applications; errors stop reading. If no directory is available, supply your
+card's documented 5-to-16-byte AID to use `emv::read_pan` instead. Do not guess
+identifiers. An AID is still selected internally even when it is not an argument.
+The example prints only the PAN to stdout; its privacy warning and errors go
+to stderr. It fails explicitly if no PAN is available. It sends GPO and reads
+advertised standard records, with the same restrictions described for `--info`.
+It does not read vehicle-registration files or infer PANs from Track 2.
 
 ## Run on Windows
 
@@ -189,6 +216,12 @@ recognized), application label, cardholder name, masked PAN (last four digits
 only), expiry/effective dates, issuer country, application currency and decimal
 places, preferred language, priority, PAN sequence number, service code, and
 application version. Missing fields are explicitly marked as not provided.
+
+Each discovered application gets its own table with an **Application AID** row.
+Different applications on the same card may expose identical card details but
+different priorities; both tables are retained and identified by their AIDs.
+This also applies with `--show-pan`. To read only one application, use
+`--info --aid YOUR_APPLICATION_ID_AS_HEX`.
 
 Dates are displayed as `20YY-MM-DD` after validating the EMV `YYMMDD` calendar
 date; the chip does not provide a century. Application versions remain hex.
