@@ -1,5 +1,10 @@
 use omnismart::{ReaderContext, dump, emv, select_reader, sle4428};
-use std::{error::Error, io, path::Path, process::ExitCode};
+use std::{
+    error::Error,
+    io::{self, IsTerminal, Write},
+    path::Path,
+    process::ExitCode,
+};
 
 fn main() -> ExitCode {
     match read_card() {
@@ -17,13 +22,37 @@ struct Arguments<'a> {
     dump_path: Option<&'a Path>,
     show_pan: bool,
     sync_api_path: Option<&'a Path>,
+    write: Option<sle4428::WriteRequest>,
 }
 
 fn parse_arguments(arguments: &[String]) -> io::Result<Arguments<'_>> {
-    if let [mode, option, path] = arguments
-        && mode == "--sle4428"
-        && option == "--sync-api"
-    {
+    if arguments.first().is_some_and(|mode| mode == "--sle4428") {
+        let (path, write) = match arguments {
+            [_, option, path] if option == "--sync-api" => (path, None),
+            [_, option, path, write, address, data]
+                if option == "--sync-api" && write == "--write" =>
+            {
+                let address =
+                    u32::from_str_radix(address.strip_prefix("0x").unwrap_or(address), 16)
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "Write address must be hexadecimal, 0000..03FC.",
+                            )
+                        })?;
+                (
+                    path,
+                    Some(sle4428::WriteRequest::new(address, parse_hex(data)?)?),
+                )
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Usage: omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH [--write ADDRESS_HEX DATA_HEX]. \
+                 Cannot combine with EMV options or supply a PIN on the command line.",
+                ));
+            }
+        };
         let path = Path::new(path);
         if !path.is_absolute() {
             return Err(io::Error::new(
@@ -36,6 +65,7 @@ fn parse_arguments(arguments: &[String]) -> io::Result<Arguments<'_>> {
             dump_path: None,
             show_pan: false,
             sync_api_path: Some(path),
+            write,
         });
     }
     let (aid, dump_path, show_pan) = match arguments {
@@ -79,7 +109,85 @@ fn parse_arguments(arguments: &[String]) -> io::Result<Arguments<'_>> {
         dump_path,
         show_pan,
         sync_api_path: None,
+        write: None,
     })
+}
+
+fn parse_hex(value: &str) -> io::Result<Vec<u8>> {
+    let value: Vec<u8> = value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    if value.is_empty()
+        || !value.len().is_multiple_of(2)
+        || !value.iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Hex data must contain complete hexadecimal byte pairs.",
+        ));
+    }
+    value
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let digit = |byte: u8| {
+                if byte.is_ascii_digit() {
+                    byte - b'0'
+                } else {
+                    byte.to_ascii_lowercase() - b'a' + 10
+                }
+            };
+            Ok(digit(pair[0]) * 16 + digit(pair[1]))
+        })
+        .collect()
+}
+
+fn parse_pin(value: &str) -> io::Result<[u8; 2]> {
+    parse_hex(value)?.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PIN must contain exactly two hexadecimal bytes. No PIN attempt was made.",
+        )
+    })
+}
+
+fn confirm_write(reader: &str, request: &sle4428::WriteRequest) -> io::Result<[u8; 2]> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SLE4428 writes require an interactive terminal for confirmation and hidden PIN input.",
+        ));
+    }
+    eprintln!("WARNING: Writing can destroy card data. Back up memory first.");
+    eprintln!(
+        "Reader: {reader}; write {} bytes at {:04X}..{:04X}.",
+        request.data().len(),
+        request.address(),
+        request.address() + request.data().len() as u32 - 1
+    );
+    eprintln!(
+        "An incorrect PIN consumes retries. One attempt only; no PIN changes or permanent protection."
+    );
+    eprint!("Type WRITE to confirm, or anything else to cancel: ");
+    io::stderr().flush()?;
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+    require_write_confirmation(&response)?;
+    let pin =
+        rpassword::prompt_password("Enter the card's 2-byte PIN as four hex digits (hidden): ")?;
+    parse_pin(&pin)
+}
+
+fn require_write_confirmation(response: &str) -> io::Result<()> {
+    if response.trim() != "WRITE" {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Write cancelled. No PIN attempt or write was made.",
+        ));
+    }
+    Ok(())
 }
 
 fn read_card() -> Result<(), Box<dyn Error>> {
@@ -89,6 +197,19 @@ fn read_card() -> Result<(), Box<dyn Error>> {
         println!("       omnismart --info [--aid HEX] [--show-pan]");
         println!("       omnismart --dump PATH [--aid HEX]");
         println!("       omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH");
+        println!(
+            "       omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH --write ADDRESS_HEX DATA_HEX"
+        );
+        println!(
+            "--write: explicitly write unprotected SLE4428 bytes, then verify by reading back."
+        );
+        println!("Write addresses: 0000..03FC (hex); security addresses 03FD..03FF are blocked.");
+        println!(
+            "Writes require interactive confirmation and a hidden 2-byte PIN; one attempt, no retries."
+        );
+        println!(
+            "No PIN changes, permanent protection, or reader configuration changes are supported."
+        );
         println!("Without arguments: read the ATR only.");
         println!("--emv: print raw EMV directory and application-selection responses.");
         println!("--info: read general information and cardholder name, if exposed.");
@@ -116,7 +237,15 @@ fn read_card() -> Result<(), Box<dyn Error>> {
         dump_path,
         show_pan,
         sync_api_path,
+        write,
     } = parse_arguments(&arguments)?;
+    if write.is_some() && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SLE4428 writes require an interactive terminal for confirmation and hidden PIN input.",
+        )
+        .into());
+    }
     let sync_api = sync_api_path
         .map(sle4428::SynchronousApi::load)
         .transpose()?;
@@ -133,6 +262,16 @@ fn read_card() -> Result<(), Box<dyn Error>> {
 
     println!("Connecting through: {}", reader.to_string_lossy());
     if let Some(api) = sync_api {
+        if let Some(request) = write {
+            let pin = confirm_write(&reader.to_string_lossy(), &request)?;
+            api.write(reader, &request, pin)?;
+            println!(
+                "SLE4428 write completed and read-back verified ({} bytes at {:04X}).",
+                request.data().len(),
+                request.address()
+            );
+            return Ok(());
+        }
         println!("WARNING: Raw SLE4428 memory may contain sensitive data. Keep output private.");
         println!("Read-only mode: no PIN attempts, writes, or reader configuration changes.");
         let memory = api.read(reader)?;
@@ -248,6 +387,7 @@ mod tests {
             dump_path: None,
             show_pan: parsed.show_pan,
             sync_api_path: None,
+            write: None,
         })
     }
 
@@ -322,6 +462,63 @@ mod tests {
 
         for arguments in [vec![], vec!["--emv"], vec!["--info"]] {
             assert!(parse(&arguments).unwrap().sync_api_path.is_none());
+        }
+    }
+
+    #[test]
+    fn parses_explicit_bounded_hex_write_only_in_synchronous_mode() {
+        let path = std::env::temp_dir().join("scardsyn.dll");
+        let path = path.to_str().unwrap();
+        for (address, data) in [("0020", "AAbb"), ("0x20", "AA bb")] {
+            let arguments =
+                ["--sle4428", "--sync-api", path, "--write", address, data].map(str::to_owned);
+            let parsed = parse_arguments(&arguments).unwrap();
+            let request = parsed.write.unwrap();
+            assert_eq!(request.address(), 0x20);
+            assert_eq!(request.data(), [0xAA, 0xBB]);
+            assert!(!parsed.show_pan);
+            assert!(parsed.aid.is_none());
+            assert!(parsed.dump_path.is_none());
+        }
+        for (address, data) in [
+            ("xyz", "AA"),
+            ("-1", "AA"),
+            ("FFFFFFFFF", "AA"),
+            ("03FD", "AA"),
+            ("03FC", "AABB"),
+            ("0020", ""),
+            ("0020", "A"),
+            ("0020", "GG"),
+            ("0020", "é"),
+        ] {
+            let arguments =
+                ["--sle4428", "--sync-api", path, "--write", address, data].map(str::to_owned);
+            assert_eq!(
+                parse_arguments(&arguments).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn pin_parsing_requires_exactly_two_bytes_without_echoing_input() {
+        assert_eq!(parse_pin("1234").unwrap(), [0x12, 0x34]);
+        assert_eq!(parse_pin("aA bB").unwrap(), [0xAA, 0xBB]);
+        for value in ["", "12", "123", "123456", "gggg", "秘密"] {
+            assert_eq!(
+                parse_pin(value).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn write_confirmation_has_no_default_or_automatic_acceptance() {
+        require_write_confirmation("WRITE\r\n").unwrap();
+        for response in ["", "\n", "yes", "Y", "write", "WRITE anything"] {
+            let error = require_write_confirmation(response).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(error.to_string().contains("No PIN attempt or write"));
         }
     }
 }

@@ -119,3 +119,74 @@ fn missing_synchronous_dll_fails_before_accessing_a_reader() {
             .contains("Reader:")
     );
 }
+
+#[test]
+fn write_requires_an_interactive_terminal_before_accessing_hardware() {
+    let dll = std::env::temp_dir().join("not-loaded.dll");
+    let output = Command::new(env!("CARGO_BIN_EXE_omnismart"))
+        .args(["--sle4428", "--sync-api"])
+        .arg(dll)
+        .args(["--write", "0020", "AABB"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("interactive terminal")
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn write_options_cannot_mix_with_emv_or_expose_a_pin_argument() {
+    let dll = std::env::temp_dir().join("not-loaded.dll");
+    let dll = dll.to_str().unwrap();
+    for arguments in [
+        vec!["--write", "0020", "AA"],
+        vec!["--emv", "--write", "0020", "AA"],
+        vec!["--info", "--write", "0020", "AA"],
+        vec!["--dump", "file.json", "--write", "0020", "AA"],
+        vec!["--sle4428", "--sync-api", dll, "--write", "0020"],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "0020",
+            "AA",
+            "--pin",
+            "1234",
+        ],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "0020",
+            "AA",
+            "--yes",
+        ],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "0020",
+            "AA",
+            "--write",
+            "0021",
+            "BB",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_omnismart"))
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "Accepted: {arguments:?}");
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(!error.contains("1234"));
+        assert!(output.stdout.is_empty());
+    }
+}

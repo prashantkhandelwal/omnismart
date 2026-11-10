@@ -44,6 +44,9 @@ Public API:
 - `sle4428::SynchronousApi::load` loads an explicitly selected HID DLL on Windows.
   Its `read` method accepts a PC/SC reader name and returns all 1024 main-memory
   bytes without printing, writing, PIN attempts, or reader configuration changes.
+  Its explicit `write` method accepts a validated `sle4428::WriteRequest` and
+  a 2-byte PIN, checks protection, writes without setting protection bits, and
+  verifies by reading back. Library callers must obtain their own confirmation.
 - `CardConnection::with_transaction` supplies a raw APDU transport closure,
   ends exclusive access with `LeaveCard`, and preserves operation/cleanup errors.
 - `emv::parse_aid`, `read_directory`, `read_information`, and `read_dump` expose
@@ -87,7 +90,7 @@ so callers must ensure their own commands are authorized and appropriate.
 **Card compatibility is unchanged:** a library refactor does not add support
 for proprietary RC protocols or make a card that rejects SELECT readable.
 The supplied EMV helpers are for payment applications, not vehicle-registration
-files. GPO may affect card state/counters; no helper sends PIN verification,
+files. GPO may affect card state/counters; no EMV helper sends PIN verification,
 writes, or payment authorization commands. Names remain personal information,
 and dumps/raw responses can contain full account data. Keep them private.
 
@@ -181,7 +184,7 @@ Use its dedicated mode rather than `--info`, `--emv`, or `--dump`:
 
 ```powershell
 # Replace this example path with your trusted HID Synchronous-API installation.
-cargo run -- --sle4428 --sync-api "C:\HID\Synchronous-API\x64\scardsyn.dll"
+cargo run -- --sle4428 --sync-api "C:\Windows\System32\scardsynx64.dll"
 ```
 
 Prerequisites:
@@ -189,7 +192,7 @@ Prerequisites:
 - Install the model-compatible HID OMNIKEY driver with synchronous-card support.
   The generic Microsoft CCID driver may not provide the required support.
 - Obtain HID's [Synchronous-API package](https://www.hidglobal.com/drivers/29915).
-  Supply an **absolute path** to its authentic `scardsyn.dll`. Loading a DLL
+  Supply an **absolute path** to its authentic `scardsyn.dll` or `scardsynx64.dll`. Loading a DLL
   executes native code: do not use untrusted downloads.
 - Match the DLL architecture to the executable (normally x64 on 64-bit Windows).
   A 32-bit DLL requires a 32-bit executable; it cannot be loaded by an x64 build.
@@ -218,6 +221,54 @@ card-type guessing is performed. Existing commands (`cargo run`, `--info`,
 `--emv`, `--aid`, `--show-pan`, and `--dump`) retain their behavior and do not
 require the HID DLL. The SLE4428 backend is Windows-only; other platforms
 return an explicit unsupported-platform error.
+
+#### Explicit SLE4428 writing
+
+Only write to your own card, after backing up its memory and confirming its
+application layout. Without `--write`, the SLE4428 mode remains read-only.
+Writing is separate from all EMV modes and requires an interactive terminal:
+
+```powershell
+# Example ONLY: overwrite two bytes at hex address 0020 with AA BB.
+# Choose an address and data appropriate for your own card.
+cargo run -- --sle4428 --sync-api "C:\Windows\System32\scardsynx64.dll" --write 0020 "AA BB"
+```
+
+Address and data are hexadecimal; the address optionally accepts a `0x` prefix.
+Data must contain complete byte pairs, with optional ASCII whitespace.
+The CLI displays the reader, address range, and byte count, then requires you
+to type `WRITE`. Any other response cancels without a PIN attempt or write.
+It then prompts for the card's **2-byte PSC/PIN** with input hidden. There is
+no default PIN, PIN argument, environment-variable PIN, `--yes`, or piped-input
+mode. Do not guess security codes; incorrect verification consumes limited
+attempts and can permanently block writes.
+
+The write path:
+
+1. Connects exclusively and validates the three-wire ATR.
+2. Checks every target byte using `SCard3WBPVerifyProtectBit`. A protected
+   byte or failed protection check stops before any PIN attempt or write.
+3. Calls `SCard3WBPPresentPIN` once with your supplied PIN; no automatic retry.
+4. Calls `SCard3WBPWriteData` once with `fProtect = FALSE`.
+5. Calls `SCard3WBPReadData` for the written range and compares every byte.
+6. Disconnects with a card reset to clear verification state, on success or
+   failure. Read-only mode still leaves the card powered as before.
+
+Only nonempty writes entirely within **0000..03FC** are accepted.
+**03FD..03FF are reserved for security state and blocked**, including requests
+crossing into that range. No PIN-changing or permanent-protection API is
+exposed. Existing permanently protected bytes cannot be overwritten.
+
+Writes are **not atomic**: a native error, disconnect, or verification failure
+may leave partially changed memory. There is no automatic retry or rollback.
+Cleanup errors are reported even when the data write succeeded. If anything
+fails, inspect the card before considering another write; do not blindly retry.
+
+The CLI does not print the PIN, data bytes, or raw read-back. However, **hex
+data passed as arguments can appear in shell history and process listings**.
+For sensitive payloads, use `SynchronousApi::write` from your own application
+instead of command-line data. That library method does not prompt: the caller
+is responsible for authorization, confirmation, and secure handling.
 
 ### EMV payment cards
 
@@ -314,7 +365,7 @@ Both GPO response formats (`80` and `77`) are supported.
 
 GPO initializes EMV processing and may affect issuer-specific card state or
 counters, but this tool does not authorize or complete a payment. No PIN
-verification, writes, or GENERATE AC commands are sent in any mode.
+verification, writes, or GENERATE AC commands are sent in any EMV mode.
 No mode retrieves a PIN, protected private keys, or printed CVV2.
 
 Name reading currently supports only applications with an absent or empty
@@ -398,5 +449,10 @@ SLE4428 tests cover mode isolation, DLL-path validation, ATR-family checks,
 native read size/address, and explicit native errors using a synthetic API
 function. Real SLE4428 reset/driver/DLL compatibility and memory contents
 must still be verified with the reader, vendor software, and card.
+Synthetic write tests cover range/security-address rejection, protection and
+PIN failures, single-attempt ordering, native function arguments, disabled
+permanent protection, read-back mismatch/errors, confirmation parsing,
+noninteractive rejection, and separation from EMV. Tests never write to a
+physical card or present a PIN to one.
 
 API documentation: https://docs.rs/pcsc/latest/pcsc/
