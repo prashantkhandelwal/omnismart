@@ -1,3 +1,4 @@
+use omnismart::sle4428::{parse_hex, parse_pin};
 use omnismart::{ReaderContext, dump, emv, select_reader, sle4428};
 use std::{
     error::Error,
@@ -29,7 +30,7 @@ fn parse_arguments(arguments: &[String]) -> io::Result<Arguments<'_>> {
     if arguments.first().is_some_and(|mode| mode == "--sle4428") {
         let (path, write) = match arguments {
             [_, option, path] if option == "--sync-api" => (path, None),
-            [_, option, path, write, address, data]
+            [_, option, path, write, address, data, rest @ ..]
                 if option == "--sync-api" && write == "--write" =>
             {
                 let address =
@@ -40,15 +41,32 @@ fn parse_arguments(arguments: &[String]) -> io::Result<Arguments<'_>> {
                                 "Write address must be hexadecimal, 0000..03FC.",
                             )
                         })?;
-                (
-                    path,
-                    Some(sle4428::WriteRequest::new(address, parse_hex(data)?)?),
-                )
+                let request = sle4428::WriteRequest::new(address, parse_hex(data)?)?;
+                let request = match rest {
+                    [] => request,
+                    [option] if option == "--replace" => request.replace_to_end()?,
+                    [option, length] if option == "--field-length" => {
+                        let length = length.parse::<usize>().map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "--field-length must be a decimal byte count.",
+                            )
+                        })?;
+                        request.pad_to(length)?
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Optional write padding: --replace OR --field-length DECIMAL_BYTES (once, after data; mutually exclusive).",
+                        ));
+                    }
+                };
+                (path, Some(request))
             }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "Usage: omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH [--write ADDRESS_HEX DATA_HEX]. \
+                    "Usage: omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH [--write ADDRESS_HEX DATA_HEX [--replace | --field-length DECIMAL_BYTES]]. \
                  Cannot combine with EMV options or supply a PIN on the command line.",
                 ));
             }
@@ -113,46 +131,6 @@ fn parse_arguments(arguments: &[String]) -> io::Result<Arguments<'_>> {
     })
 }
 
-fn parse_hex(value: &str) -> io::Result<Vec<u8>> {
-    let value: Vec<u8> = value
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect();
-    if value.is_empty()
-        || !value.len().is_multiple_of(2)
-        || !value.iter().all(u8::is_ascii_hexdigit)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Hex data must contain complete hexadecimal byte pairs.",
-        ));
-    }
-    value
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let digit = |byte: u8| {
-                if byte.is_ascii_digit() {
-                    byte - b'0'
-                } else {
-                    byte.to_ascii_lowercase() - b'a' + 10
-                }
-            };
-            Ok(digit(pair[0]) * 16 + digit(pair[1]))
-        })
-        .collect()
-}
-
-fn parse_pin(value: &str) -> io::Result<[u8; 2]> {
-    parse_hex(value)?.try_into().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "PIN must contain exactly two hexadecimal bytes. No PIN attempt was made.",
-        )
-    })
-}
-
 fn confirm_write(reader: &str, request: &sle4428::WriteRequest) -> io::Result<[u8; 2]> {
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return Err(io::Error::new(
@@ -167,6 +145,12 @@ fn confirm_write(reader: &str, request: &sle4428::WriteRequest) -> io::Result<[u
         request.address(),
         request.address() + request.data().len() as u32 - 1
     );
+    if request.padding_len() > 0 {
+        eprintln!(
+            "Includes {} trailing 00 bytes to clear the rest of the specified field.",
+            request.padding_len()
+        );
+    }
     eprintln!(
         "An incorrect PIN consumes retries. One attempt only; no PIN changes or permanent protection."
     );
@@ -198,12 +182,19 @@ fn read_card() -> Result<(), Box<dyn Error>> {
         println!("       omnismart --dump PATH [--aid HEX]");
         println!("       omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH");
         println!(
-            "       omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH --write ADDRESS_HEX DATA_HEX"
+            "       omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH --write ADDRESS_HEX DATA_HEX [--replace | --field-length DECIMAL_BYTES]"
         );
         println!(
             "--write: explicitly write unprotected SLE4428 bytes, then verify by reading back."
         );
         println!("Write addresses: 0000..03FC (hex); security addresses 03FD..03FF are blocked.");
+        println!(
+            "--field-length: with --write only, zero-pad to this decimal byte count to clear old trailing data."
+        );
+        println!("--replace: with --write only, clear ALL trailing writable bytes through 03FC.");
+        println!(
+            "WARNING: --replace can erase unrelated data after the payload; cannot combine with --field-length."
+        );
         println!(
             "Writes require interactive confirmation and a hidden 2-byte PIN; one attempt, no retries."
         );
@@ -519,6 +510,61 @@ mod tests {
             let error = require_write_confirmation(response).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
             assert!(error.to_string().contains("No PIN attempt or write"));
+        }
+    }
+
+    #[test]
+    fn replace_option_clears_the_remaining_area() {
+        let path = std::env::temp_dir().join("not-loaded.dll");
+        let arguments = [
+            "--sle4428",
+            "--sync-api",
+            path.to_str().unwrap(),
+            "--write",
+            "0020",
+            "4869",
+            "--replace",
+        ]
+        .map(str::to_owned);
+        let parsed = parse_arguments(&arguments).unwrap();
+        let request = parsed.write.unwrap();
+        assert_eq!(request.data().len(), 989);
+        assert_eq!(&request.data()[..2], b"Hi");
+        assert!(request.data()[2..].iter().all(|byte| *byte == 0));
+        assert_eq!(request.padding_len(), 987);
+    }
+
+    #[test]
+    fn optional_field_length_pads_cli_payload_with_zeroes() {
+        let path = std::env::temp_dir().join("not-loaded.dll");
+        let arguments = [
+            "--sle4428",
+            "--sync-api",
+            path.to_str().unwrap(),
+            "--write",
+            "0020",
+            "4869",
+            "--field-length",
+            "8",
+        ]
+        .map(str::to_owned);
+        let parsed = parse_arguments(&arguments).unwrap();
+        let request = parsed.write.unwrap();
+        assert_eq!(request.address(), 0x20);
+        assert_eq!(request.data(), b"Hi\0\0\0\0\0\0");
+        assert_eq!(request.padding_len(), 6);
+        for length in [
+            "0",
+            "1",
+            "990",
+            "0x20",
+            "invalid",
+            "-1",
+            "99999999999999999999999999999999",
+        ] {
+            let mut arguments = arguments.clone();
+            arguments[7] = length.to_owned();
+            assert!(parse_arguments(&arguments).is_err());
         }
     }
 }

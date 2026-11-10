@@ -119,6 +119,78 @@ to stderr. It fails explicitly if no PAN is available. It sends GPO and reads
 advertised standard records, with the same restrictions described for `--info`.
 It does not read vehicle-registration files or infer PANs from Track 2.
 
+## Desktop GUI (egui)
+
+The optional native GUI reads and writes **SLE4428 memory cards** using the
+same library safeguards as the CLI. EMV remains available through the
+existing CLI/library; the GUI does not send EMV commands.
+
+```powershell
+cargo run --features gui --bin omnismart-gui
+```
+
+For a standalone executable:
+
+```powershell
+cargo build --release --features gui --bin omnismart-gui
+.\target\release\omnismart-gui.exe
+```
+
+Windows, a compatible reader driver, and HID's Synchronous-API DLL are still
+required (see the SLE4428 prerequisites below). The GUI suggests the Windows
+system-directory DLL path; change it if your trusted HID installation differs.
+The DLL must match the executable architecture.
+
+All card inputs and selections are grouped at the top. The hex and readable
+string panels fill the area below; explanatory prose is omitted from the main
+window. Field labels, status/errors, and destructive-write confirmation remain.
+
+1. Click **Refresh readers**, then select the intended reader.
+2. Check the trusted DLL path and click **Read memory** to display all 1024
+   bytes as hex in **Read snapshot**. The **Readable string** panel to its right
+   displays UTF-8 text for an explicit hex address and decimal byte length.
+   Both panels scroll independently; invalid UTF-8 is reported, not silently
+   replaced.
+3. For writing, enter the hex address and choose **UTF-8 text** or **Hex bytes**.
+   The GUI shows the encoded byte count and available space. At address `0020`,
+   at most 989 bytes fit; multibyte UTF-8 characters use more than one byte.
+   To replace a fixed field and remove old fragments, enter its total size in
+   **Field length (bytes)** (decimal, optional). For example, `40` writes your
+   data followed by `00` bytes until all 40 bytes have been overwritten.
+   If you instead want to remove **all** trailing data regardless of its old
+   length, check **Replace through 03FC**. This option
+   disables the fixed field length and can erase unrelated fields later on the
+   card. It is off by default.
+4. Enter the card's correct two-byte PIN in the masked field, then click
+   **Review write...**. Check the reader, DLL, range, and byte count. Type
+   `WRITE` and click **Write and verify**, or **Cancel** without a PIN attempt.
+
+Only unprotected bytes within `0000..03FC` can be written. Security addresses,
+PIN changes, and permanent-protection operations are not exposed. A write
+checks protection, makes one PIN attempt without retries, writes, reads back
+to verify, and resets the card to clear verification state. It may fail after
+partially changing memory; do not blindly retry.
+
+Text is stored as raw UTF-8 bytes with no automatic length header or terminator.
+With a blank field length and Replace unchecked, shorter writes leave trailing old bytes unchanged.
+With a field length, unused bytes are explicitly zero-padded. The GUI cannot
+infer the previous string's length: specify the full existing field size.
+Use the actual encoded text byte count when previewing text; padding is NUL
+bytes, not printable spaces.
+
+Reader discovery and card I/O run off the UI thread, one operation at a time.
+The GUI prevents normal window closure while I/O is pending. Do not remove the
+card, disconnect the reader, or force-terminate the app during a write. Read
+snapshots are cleared when the reader/DLL changes or another operation starts.
+
+**Privacy:** Keep the window private: memory, text, and hex data are visible.
+The application does not save PINs/card data, persist form state, or print raw
+card responses to a console. Closing it discards in-memory state, not data
+already written to the card. Back up your card before writing.
+
+The GUI dependency is opt-in. Existing `cargo run -- ...` commands still select
+the original CLI, and ordinary CLI builds do not compile egui.
+
 ## Run on Windows
 
 1. Install the stable Rust toolchain using rustup from https://rustup.rs/.
@@ -236,6 +308,36 @@ cargo run -- --sle4428 --sync-api "C:\Windows\System32\scardsynx64.dll" --write 
 
 Address and data are hexadecimal; the address optionally accepts a `0x` prefix.
 Data must contain complete byte pairs, with optional ASCII whitespace.
+To remove fragments of an older, longer value, supply **`--field-length N`**
+after the data, where `N` is the total field size in **decimal bytes**:
+
+```powershell
+# Write "Hi" (UTF-8 hex 48 69) and clear the remaining 38 bytes of a 40-byte field.
+cargo run -- --sle4428 --sync-api "C:\Windows\System32\scardsynx64.dll" --write 0020 "48 69" --field-length 40
+```
+
+The payload is followed by `00` bytes to fill the field. Payloads larger than
+the field, zero-length fields, and fields crossing `03FD` are rejected before
+card access. No truncation or automatic old-length detection is performed.
+Omit the option for the original raw-write behavior (trailing bytes unchanged).
+The library provides the same behavior through `WriteRequest::pad_to`.
+
+To replace a value without knowing the old length, use **`--replace`** instead:
+
+```powershell
+# Write "Hi", then zero-fill every remaining writable byte through 03FC.
+cargo run -- --sle4428 --sync-api "C:\Windows\System32\scardsynx64.dll" --write 0020 "48 69" --replace
+```
+
+Starting at `0020`, this overwrites **989 bytes**: two payload bytes and 987
+zero bytes in this example. All bytes before `0020` and security addresses
+`03FD..03FF` remain untouched. This removes old fragments regardless of length
+within that range, but **also erases any unrelated data after the payload**.
+Every byte in the range must be unprotected, even bytes being cleared; a
+protected tail stops the operation before PIN verification or writing.
+`--replace` and `--field-length` are mutually exclusive and require `--write`.
+The library equivalent is `WriteRequest::replace_to_end`.
+
 The CLI displays the reader, address range, and byte count, then requires you
 to type `WRITE`. Any other response cancels without a PIN attempt or write.
 It then prompts for the card's **2-byte PSC/PIN** with input hidden. There is
@@ -253,6 +355,13 @@ The write path:
 5. Calls `SCard3WBPReadData` for the written range and compares every byte.
 6. Disconnects with a card reset to clear verification state, on success or
    failure. Read-only mode still leaves the card powered as before.
+
+When a field length or replacement is supplied, all these checks and the read-back comparison
+cover the **entire padded field**, not just the new payload. Confirmation
+reports the full overwritten range and padding count. A protected byte in the
+padding region stops the operation before any PIN attempt or write.
+Data outside the specified field is not touched. Back up first: choosing an
+overly large field can erase unrelated data.
 
 Only nonempty writes entirely within **0000..03FC** are accepted.
 **03FD..03FF are reserved for security state and blocked**, including requests
@@ -439,6 +548,9 @@ Connection/status failures before dump creation do not create a dump.
 cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
+# Include the optional GUI and its headless tests:
+cargo test --features gui
+cargo clippy --features gui --all-targets -- -D warnings
 ```
 
 Unit tests cover reader selection, AID validation, TLV parsing, directory
@@ -454,5 +566,14 @@ PIN failures, single-attempt ordering, native function arguments, disabled
 permanent protection, read-back mismatch/errors, confirmation parsing,
 noninteractive rejection, and separation from EMV. Tests never write to a
 physical card or present a PIN to one.
+GUI tests use synthetic data for UTF-8/hex payloads, byte limits, text-preview
+ranges, frozen write confirmation, worker failures, and headless rendering.
+They do not access a physical reader or write to a card.
+Fixed-field overwrite tests verify zero-padding, old-fragment removal, unchanged
+neighboring bytes, protection checks on padding, UTF-8 byte counts, security
+boundaries, and unchanged behavior when field length is omitted.
+Replacement tests additionally cover clearing exactly through `03FC`, protection
+checks at the end of the range, opt-in GUI behavior, and mutually exclusive CLI
+options. No hardware writes are used.
 
 API documentation: https://docs.rs/pcsc/latest/pcsc/

@@ -190,3 +190,124 @@ fn write_options_cannot_mix_with_emv_or_expose_a_pin_argument() {
         assert!(output.stdout.is_empty());
     }
 }
+
+#[test]
+fn replacement_options_are_explicit_and_mutually_exclusive() {
+    let dll = std::env::temp_dir().join("not-loaded.dll");
+    let dll = dll.to_str().unwrap();
+    for arguments in [
+        vec!["--replace"],
+        vec!["--info", "--replace"],
+        vec!["--emv", "--replace"],
+        vec!["--sle4428", "--sync-api", dll, "--replace"],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "20",
+            "AA",
+            "--replace",
+            "--replace",
+        ],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "20",
+            "AA",
+            "--replace",
+            "--field-length",
+            "64",
+        ],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "20",
+            "AA",
+            "--field-length",
+            "64",
+            "--replace",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_omnismart"))
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "Accepted: {arguments:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            !String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("Cannot load HID")
+        );
+    }
+}
+
+#[test]
+fn malformed_field_length_options_fail_before_hardware_access() {
+    let dll = std::env::temp_dir().join("not-loaded.dll");
+    let dll = dll.to_str().unwrap();
+    for arguments in [
+        vec!["--field-length", "8"],
+        vec!["--info", "--field-length", "8"],
+        vec!["--emv", "--field-length", "8"],
+        vec!["--sle4428", "--sync-api", dll, "--field-length", "8"],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "20",
+            "AA",
+            "--field-length",
+        ],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "20",
+            "AA",
+            "--field-length",
+            "0",
+        ],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "20",
+            "AA",
+            "--field-length",
+            "990",
+        ],
+        vec![
+            "--sle4428",
+            "--sync-api",
+            dll,
+            "--write",
+            "20",
+            "AA",
+            "--field-length",
+            "8",
+            "--field-length",
+            "8",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_omnismart"))
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "Accepted: {arguments:?}");
+        assert!(output.stdout.is_empty());
+        assert!(
+            !String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("Cannot load HID")
+        );
+    }
+}

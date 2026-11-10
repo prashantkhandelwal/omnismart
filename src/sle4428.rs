@@ -12,10 +12,53 @@ pub const MEMORY_SIZE: usize = 1024;
 /// Exclusive upper write bound: reserves 03FD..03FF for security state.
 pub const WRITE_LIMIT: usize = 0x03FD;
 
+/// Decodes complete hex byte pairs, allowing ASCII whitespace between digits.
+pub fn parse_hex(value: &str) -> io::Result<Vec<u8>> {
+    let value: Vec<u8> = value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    if value.is_empty()
+        || !value.len().is_multiple_of(2)
+        || !value.iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Hex data must contain complete hexadecimal byte pairs.",
+        ));
+    }
+    value
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let digit = |byte: u8| {
+                if byte.is_ascii_digit() {
+                    byte - b'0'
+                } else {
+                    byte.to_ascii_lowercase() - b'a' + 10
+                }
+            };
+            Ok(digit(pair[0]) * 16 + digit(pair[1]))
+        })
+        .collect()
+}
+
+/// Decodes a two-byte PSC/PIN without including the supplied value in errors.
+pub fn parse_pin(value: &str) -> io::Result<[u8; 2]> {
+    parse_hex(value)?.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PIN must contain exactly two hexadecimal bytes. No PIN attempt was made.",
+        )
+    })
+}
+
 /// A bounded main-memory write. Does not include a PIN or protection settings.
 pub struct WriteRequest {
     address: u32,
     data: Vec<u8>,
+    payload_len: usize,
 }
 
 impl std::fmt::Debug for WriteRequest {
@@ -24,6 +67,7 @@ impl std::fmt::Debug for WriteRequest {
             .debug_struct("WriteRequest")
             .field("address", &self.address)
             .field("length", &self.data.len())
+            .field("padding_length", &self.padding_len())
             .finish()
     }
 }
@@ -43,7 +87,42 @@ impl WriteRequest {
                  Security addresses 03FD..03FF cannot be written.",
             ));
         }
-        Ok(Self { address, data })
+        let payload_len = data.len();
+        Ok(Self {
+            address,
+            data,
+            payload_len,
+        })
+    }
+
+    /// Zero-pads this write to a fixed field length in bytes.
+    ///
+    /// Never truncates data or crosses security addresses. The entire padded
+    /// field participates in protection checks, confirmation, and verification.
+    pub fn pad_to(mut self, field_length: usize) -> io::Result<Self> {
+        if field_length < self.data.len() || field_length > WRITE_LIMIT - self.address as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Field length must be at least the payload byte count and fit within 0000..03FC.",
+            ));
+        }
+        self.data.resize(field_length, 0);
+        Ok(self)
+    }
+
+    /// Clears any unknown-length trailing data through the last writable byte.
+    ///
+    /// This overwrites all data after the payload through 03FC, including any
+    /// unrelated fields there. Bytes before the address and security bytes are
+    /// untouched. All target bytes must be unprotected.
+    pub fn replace_to_end(self) -> io::Result<Self> {
+        let length = WRITE_LIMIT - self.address as usize;
+        self.pad_to(length)
+    }
+
+    /// Number of zero-padding bytes added after the original payload.
+    pub fn padding_len(&self) -> usize {
+        self.data.len() - self.payload_len
     }
 
     pub fn address(&self) -> u32 {
@@ -698,6 +777,73 @@ mod windows {
                 assert!(error.contains(&format!("0x{status:08X}")));
             }
         }
+
+        #[test]
+        fn padded_write_clears_old_fragments_only_inside_the_field() {
+            use std::cell::RefCell;
+            let memory = RefCell::new([b'X'; 16]);
+            let checked = RefCell::new(Vec::new());
+            let request = WriteRequest::new(2, b"Hi".to_vec())
+                .unwrap()
+                .pad_to(8)
+                .unwrap();
+            write_verified(
+                &request,
+                |address| {
+                    checked.borrow_mut().push(address);
+                    Ok(false)
+                },
+                || Ok(()),
+                || {
+                    memory.borrow_mut()[2..10].copy_from_slice(request.data());
+                    Ok(())
+                },
+                |buffer| {
+                    buffer.copy_from_slice(&memory.borrow()[2..10]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(*checked.borrow(), (2..10).collect::<Vec<_>>());
+            assert_eq!(&memory.borrow()[..2], b"XX");
+            assert_eq!(&memory.borrow()[2..10], b"Hi\0\0\0\0\0\0");
+            assert_eq!(&memory.borrow()[10..], b"XXXXXX");
+        }
+
+        #[test]
+        fn replacement_checks_even_the_last_padding_byte_before_pin() {
+            let request = WriteRequest::new(0x20, vec![0xAA])
+                .unwrap()
+                .replace_to_end()
+                .unwrap();
+            let error = write_verified(
+                &request,
+                |address| Ok(address == 0x03FC),
+                || panic!("PIN must not be presented"),
+                || panic!("Write must not start"),
+                |_| panic!("Read-back must not start"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("03FC"));
+        }
+
+        #[test]
+        fn protected_padding_stops_before_pin_or_write() {
+            let request = WriteRequest::new(0x20, vec![0xAA])
+                .unwrap()
+                .pad_to(2)
+                .unwrap();
+            let error = write_verified(
+                &request,
+                |address| Ok(address == 0x21),
+                || panic!("PIN must not be presented"),
+                || panic!("Write must not start"),
+                |_| panic!("Read-back must not start"),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
     }
 }
 
@@ -740,5 +886,69 @@ mod tests {
             assert_eq!(request.address(), address);
             assert_eq!(request.data().len(), length);
         }
+    }
+
+    #[test]
+    fn replacement_fills_exactly_to_the_security_boundary() {
+        let payload = vec![0x41; 20];
+        let request = WriteRequest::new(0x20, payload.clone())
+            .unwrap()
+            .replace_to_end()
+            .unwrap();
+        assert_eq!(request.data().len(), 989);
+        assert_eq!(request.padding_len(), 969);
+        assert_eq!(&request.data()[..20], payload.as_slice());
+        assert!(request.data()[20..].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            request.address() as usize + request.data().len(),
+            WRITE_LIMIT
+        );
+        let request = WriteRequest::new(0x03FC, vec![0xAA])
+            .unwrap()
+            .replace_to_end()
+            .unwrap();
+        assert_eq!(request.data(), [0xAA]);
+        assert_eq!(request.padding_len(), 0);
+    }
+
+    #[test]
+    fn padding_validates_field_bounds_before_allocation_and_never_truncates() {
+        let request = WriteRequest::new(0x20, b"Hi".to_vec()).unwrap();
+        assert_eq!(request.padding_len(), 0);
+        assert_eq!(request.data(), b"Hi");
+        let request = request.pad_to(6).unwrap();
+        assert_eq!(request.data(), b"Hi\0\0\0\0");
+        assert_eq!(request.padding_len(), 4);
+        assert_eq!(
+            WriteRequest::new(0x20, b"Hi".to_vec())
+                .unwrap()
+                .pad_to(2)
+                .unwrap()
+                .data(),
+            b"Hi"
+        );
+        for length in [0, 1, 990, usize::MAX] {
+            assert_eq!(
+                WriteRequest::new(0x20, b"Hi".to_vec())
+                    .unwrap()
+                    .pad_to(length)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let request = WriteRequest::new(0x20, vec![1])
+            .unwrap()
+            .pad_to(989)
+            .unwrap();
+        assert_eq!(request.data().len(), 989);
+        assert_eq!(request.padding_len(), 988);
+        assert!(request.data()[1..].iter().all(|byte| *byte == 0));
+        assert!(
+            WriteRequest::new(0x03FC, vec![1])
+                .unwrap()
+                .pad_to(2)
+                .is_err()
+        );
     }
 }
