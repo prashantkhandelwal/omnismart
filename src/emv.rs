@@ -6,7 +6,8 @@
 //! [`read_dump`] print progress;
 //! directory mode also prints sensitive raw responses. For structured data, use
 //! [`read_application_information`] after selecting a documented application, or
-//! decode existing TLV bytes with [`CardInformation::from_tlv`].
+//! decode existing TLV bytes with [`CardInformation::from_tlv`]. For silent
+//! discovery and reading, use [`read_card_information`].
 
 use std::io::{self, Write};
 
@@ -433,6 +434,40 @@ pub struct CardInformation {
     pub sequence: Option<String>,
     pub service_code: Option<String>,
     pub version: Option<String>,
+}
+
+/// One selected application's decoded information, with a masked PAN.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApplicationInformation {
+    pub aid: Vec<u8>,
+    pub information: CardInformation,
+}
+
+/// Discovers and reads applications without printing commands, progress, or data.
+///
+/// An explicit documented AID bypasses directory discovery. Sends SELECT, GPO,
+/// and advertised standard READ RECORD commands only; no PIN or authorization.
+/// GPO may affect card counters. Required nonempty PDOLs are unsupported.
+/// Any application error fails the read rather than returning an incomplete list.
+pub fn read_card_information(
+    mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    explicit_aid: Option<&[u8]>,
+) -> io::Result<Vec<ApplicationInformation>> {
+    let aids = if let Some(aid) = explicit_aid {
+        validate_aid(aid)?;
+        vec![aid.to_vec()]
+    } else {
+        discover_aids(&mut transmit, false)?
+    };
+    aids.into_iter()
+        .map(|aid| {
+            let response = select(&mut transmit, &aid)?;
+            require_success(&response, "Application SELECT")?;
+            let (information, _) =
+                read_application_information_inner(&mut transmit, &response.data, false, false)?;
+            Ok(ApplicationInformation { aid, information })
+        })
+        .collect()
 }
 
 fn text_field(data: &[u8], tag: u32) -> io::Result<Option<String>> {
@@ -1160,6 +1195,70 @@ mod tests {
         );
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
         assert!(!called);
+    }
+
+    #[test]
+    fn silent_information_reads_all_applications_and_masks_account_data() {
+        let mut responses = vec![
+            vec![
+                0x6F, 14, 0x4F, 5, 0xA0, 0, 0, 0, 3, 0x4F, 5, 0xA0, 0, 0, 0, 4, 0x90, 0,
+            ],
+            vec![0x6F, 0, 0x90, 0],
+            vec![0x80, 6, 0, 0, 8, 1, 1, 0, 0x90, 0],
+            vec![0x70, 6, 0x5A, 4, 0x12, 0x34, 0x56, 0x78, 0x90, 0],
+            vec![0x6F, 0, 0x90, 0],
+            vec![0x80, 2, 0, 0, 0x90, 0],
+        ]
+        .into_iter();
+        let mut commands = Vec::new();
+        let applications = read_card_information(
+            |command| {
+                commands.push(command.to_vec());
+                Ok(responses.next().unwrap())
+            },
+            None,
+        )
+        .unwrap();
+        assert!(responses.next().is_none());
+        assert_eq!(applications.len(), 2);
+        assert_eq!(applications[0].aid, [0xA0, 0, 0, 0, 3]);
+        assert_eq!(applications[1].aid, [0xA0, 0, 0, 0, 4]);
+        let masked = applications[0].information.masked_pan.as_deref().unwrap();
+        assert!(masked.ends_with("5678"));
+        assert!(!masked.contains("1234"));
+        assert!(applications[1].information.masked_pan.is_none());
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command[1])
+                .collect::<Vec<_>>(),
+            [0xA4, 0xA4, 0xA8, 0xB2, 0xA4, 0xA8]
+        );
+    }
+
+    #[test]
+    fn silent_information_validates_aid_and_propagates_failures() {
+        assert!(read_card_information(|_| panic!("No APDU for invalid AID"), Some(&[1])).is_err());
+        let aid = [0xA0, 0, 0, 0, 3];
+        let mut commands = Vec::new();
+        let mut responses = vec![vec![0x6F, 0, 0x90, 0], vec![0x69, 0x85]].into_iter();
+        let error = read_card_information(
+            |command| {
+                commands.push(command.to_vec());
+                Ok(responses.next().unwrap())
+            },
+            Some(&aid),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("GET PROCESSING OPTIONS failed"));
+        assert_eq!(commands.len(), 2);
+        assert_eq!(&commands[0][5..10], &aid);
+        assert!(
+            read_card_information(|_| Err(io::Error::other("Transport failed")), None)
+                .unwrap_err()
+                .to_string()
+                .contains("Transport failed")
+        );
     }
 
     #[test]

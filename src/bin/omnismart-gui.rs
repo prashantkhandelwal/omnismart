@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use omnismart::{
-    ReaderContext,
+    ReaderContext, emv,
     sle4428::{MEMORY_SIZE, SynchronousApi, WRITE_LIMIT, WriteRequest, parse_hex, parse_pin},
 };
 use std::{
@@ -15,7 +15,7 @@ use std::{
 
 fn main() -> eframe::Result {
     eframe::run_native(
-        "OmniSmart - SLE4428",
+        "OmniSmart",
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default().with_inner_size([850.0, 800.0]),
             ..Default::default()
@@ -30,6 +30,12 @@ enum Encoding {
     Hex,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardMode {
+    Sle4428,
+    Emv,
+}
+
 struct WriteJob {
     reader: CString,
     dll: PathBuf,
@@ -39,13 +45,21 @@ struct WriteJob {
 
 enum Operation {
     Readers,
-    Read { reader: CString, dll: PathBuf },
+    Read {
+        reader: CString,
+        dll: PathBuf,
+    },
+    ReadEmv {
+        reader: CString,
+        aid: Option<Vec<u8>>,
+    },
     Write(WriteJob),
 }
 
 enum Output {
     Readers(Vec<CString>),
     Memory(Box<[u8; MEMORY_SIZE]>),
+    Emv(String),
     Written { address: u32, length: usize },
 }
 
@@ -55,6 +69,14 @@ fn execute(operation: Operation) -> io::Result<Output> {
         Operation::Read { reader, dll } => Ok(Output::Memory(Box::new(
             SynchronousApi::load(&dll)?.read(&reader)?,
         ))),
+        Operation::ReadEmv { reader, aid } => {
+            let context = ReaderContext::establish()?;
+            let mut card = context.connect(&reader)?;
+            let applications = card.with_transaction(|transmit| {
+                emv::read_card_information(transmit, aid.as_deref())
+            })?;
+            Ok(Output::Emv(emv_report(&applications)?))
+        }
         Operation::Write(job) => {
             SynchronousApi::load(&job.dll)?.write(&job.reader, &job.request, job.pin)?;
             Ok(Output::Written {
@@ -63,6 +85,16 @@ fn execute(operation: Operation) -> io::Result<Output> {
             })
         }
     }
+}
+
+fn emv_report(applications: &[emv::ApplicationInformation]) -> io::Result<String> {
+    let mut buffer = Vec::new();
+    for application in applications {
+        application
+            .information
+            .render_information(&application.aid, &mut buffer)?;
+    }
+    String::from_utf8(buffer).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn write_request(address: &str, data: &str, encoding: Encoding) -> io::Result<WriteRequest> {
@@ -108,6 +140,9 @@ fn text_preview<'a>(memory: &'a [u8], address: &str, length: &str) -> io::Result
 }
 
 struct CardApp {
+    mode: CardMode,
+    aid: String,
+    emv: Option<String>,
     dll: String,
     readers: Vec<CString>,
     selected: Option<usize>,
@@ -143,6 +178,9 @@ impl Default for CardApp {
             String::new()
         };
         Self {
+            mode: CardMode::Sle4428,
+            aid: String::new(),
+            emv: None,
             dll,
             readers: Vec::new(),
             selected: None,
@@ -165,11 +203,15 @@ impl Default for CardApp {
 }
 
 impl CardApp {
-    fn connection(&self) -> io::Result<(CString, PathBuf)> {
-        let reader = self
-            .selected
+    fn reader(&self) -> io::Result<CString> {
+        self.selected
             .and_then(|index| self.readers.get(index))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Select a reader first."))?;
+            .cloned()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Select a reader first."))
+    }
+
+    fn connection(&self) -> io::Result<(CString, PathBuf)> {
+        let reader = self.reader()?;
         let dll = Path::new(&self.dll);
         if !dll.is_absolute() {
             return Err(io::Error::new(
@@ -177,7 +219,39 @@ impl CardApp {
                 "Enter the absolute path to a trusted HID synchronous API DLL.",
             ));
         }
-        Ok((reader.clone(), dll.to_owned()))
+        Ok((reader, dll.to_owned()))
+    }
+
+    fn read_operation(&self) -> io::Result<Operation> {
+        match self.mode {
+            CardMode::Sle4428 => {
+                let (reader, dll) = self.connection()?;
+                Ok(Operation::Read { reader, dll })
+            }
+            CardMode::Emv => Ok(Operation::ReadEmv {
+                reader: self.reader()?,
+                aid: if self.aid.trim().is_empty() {
+                    None
+                } else {
+                    Some(emv::parse_aid(self.aid.trim())?)
+                },
+            }),
+        }
+    }
+
+    fn clear_snapshot(&mut self) {
+        self.memory = None;
+        self.emv = None;
+    }
+
+    fn change_mode(&mut self, mode: CardMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.clear_snapshot();
+            self.pin.clear();
+            self.status.clear();
+            self.error = None;
+        }
     }
 
     fn start(&mut self, operation: Operation, ctx: &egui::Context) {
@@ -185,7 +259,7 @@ impl CardApp {
             self.error = Some("Wait for the current card operation to finish.".to_owned());
             return;
         }
-        self.memory = None;
+        self.clear_snapshot();
         self.error = None;
         self.status = "Working...".to_owned();
         let (sender, receiver) = mpsc::channel();
@@ -232,11 +306,15 @@ impl CardApp {
                 self.memory = Some(memory);
                 self.status = "Read 1024 bytes.".to_owned();
             }
+            Ok(Output::Emv(report)) => {
+                self.emv = Some(report);
+                self.status = "EMV read complete.".to_owned();
+            }
             Ok(Output::Written { address, length }) => {
                 self.status = format!("Write verified: {length} bytes at {address:04X}.");
             }
             Err(error) => {
-                self.memory = None;
+                self.clear_snapshot();
                 self.error = Some(format!(
                     "{error}\nNo automatic retry. If writing had begun, memory may be partially modified."
                 ));
@@ -268,6 +346,12 @@ impl CardApp {
     }
 
     fn review(&mut self) -> io::Result<()> {
+        if self.mode != CardMode::Sle4428 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "EMV mode is read-only.",
+            ));
+        }
         let (reader, dll) = self.connection()?;
         let request = self.write_request()?;
         let pin = parse_pin(&self.pin)?;
@@ -286,7 +370,15 @@ impl CardApp {
     fn ui(&mut self, ctx: &egui::Context) {
         let busy = self.worker.is_some();
         egui::TopBottomPanel::top("card-controls").show(ctx, |ui| {
-            ui.add_enabled_ui(!busy && self.pending.is_none() && cfg!(windows), |ui| {
+            ui.add_enabled_ui(!busy && self.pending.is_none(), |ui| {
+                let mut mode = self.mode;
+                ui.horizontal(|ui| {
+                    ui.label("Card");
+                    ui.radio_value(&mut mode, CardMode::Sle4428, "SLE4428");
+                    ui.radio_value(&mut mode, CardMode::Emv, "EMV (read-only)");
+                });
+                self.change_mode(mode);
+                if self.mode == CardMode::Sle4428 {
                 ui.horizontal(|ui| {
                     ui.label("HID DLL");
                     if ui
@@ -296,10 +388,19 @@ impl CardApp {
                         )
                         .changed()
                     {
-                        self.memory = None;
+                        self.clear_snapshot();
                         self.pin.clear();
                     }
                 });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("AID (hex, optional)");
+                        if ui.text_edit_singleline(&mut self.aid).changed() {
+                            self.clear_snapshot();
+                        }
+                    });
+                    ui.small("PAN masked. GPO may affect card counters; no PIN or payment authorization.");
+                }
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Refresh readers").clicked() {
                         self.readers.clear();
@@ -325,16 +426,19 @@ impl CardApp {
                             }
                         });
                     if old != self.selected {
-                        self.memory = None;
+                        self.clear_snapshot();
                         self.pin.clear();
                     }
-                    if ui.button("Read memory").clicked() {
-                        match self.connection() {
-                            Ok((reader, dll)) => self.start(Operation::Read { reader, dll }, ctx),
+                    let read_label = if self.mode == CardMode::Emv { "Read EMV" } else { "Read memory" };
+                    if ui.add_enabled(self.mode == CardMode::Emv || cfg!(windows), egui::Button::new(read_label)).clicked() {
+                        match self.read_operation() {
+                            Ok(operation) => self.start(operation, ctx),
                             Err(error) => self.error = Some(error.to_string()),
                         }
                     }
                 });
+                if self.mode == CardMode::Sle4428 {
+                ui.add_enabled_ui(cfg!(windows), |ui| {
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Write address (hex)");
@@ -400,6 +504,8 @@ impl CardApp {
                         egui::TextEdit::singleline(&mut self.preview_length).desired_width(70.0),
                     );
                 });
+                });
+                }
             });
         });
         egui::TopBottomPanel::bottom("card-status").show(ctx, |ui| {
@@ -412,7 +518,7 @@ impl CardApp {
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::RED, error);
             }
-            if !cfg!(windows) {
+            if self.mode == CardMode::Sle4428 && !cfg!(windows) {
                 ui.colored_label(
                     egui::Color32::RED,
                     "SLE4428 access is supported only on Windows.",
@@ -420,6 +526,18 @@ impl CardApp {
             }
         });
         egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(report) = &self.emv {
+                ui.heading("EMV information");
+                egui::ScrollArea::both()
+                    .id_salt("emv-information")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(report).monospace())
+                                .wrap_mode(egui::TextWrapMode::Extend),
+                        );
+                    });
+            }
             if let Some(memory) = &self.memory {
                 ui.columns(2, |columns| {
                     columns[0].heading("Read snapshot");
@@ -537,6 +655,131 @@ impl eframe::App for CardApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emv_mode_needs_no_dll_and_rejects_writes_and_invalid_aids() {
+        let mut app = CardApp {
+            mode: CardMode::Emv,
+            readers: vec![CString::new("Synthetic reader").unwrap()],
+            selected: Some(0),
+            dll: String::new(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            app.read_operation().unwrap(),
+            Operation::ReadEmv { aid: None, .. }
+        ));
+        app.aid = "A000000003".to_owned();
+        match app.read_operation().unwrap() {
+            Operation::ReadEmv { aid, reader } => {
+                assert_eq!(aid.unwrap(), [0xA0, 0, 0, 0, 3]);
+                assert_eq!(reader, app.readers[0]);
+            }
+            _ => panic!("Expected an EMV operation"),
+        }
+        assert_eq!(
+            app.review().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert!(app.pending.is_none());
+        app.aid = "invalid".to_owned();
+        assert!(app.read_operation().is_err());
+        app.selected = None;
+        assert!(app.read_operation().is_err());
+    }
+
+    #[test]
+    fn switching_modes_clears_snapshots_and_pin() {
+        let mut app = CardApp {
+            memory: Some(Box::new([0; MEMORY_SIZE])),
+            pin: "1234".to_owned(),
+            ..Default::default()
+        };
+        app.change_mode(CardMode::Emv);
+        assert!(app.memory.is_none());
+        assert!(app.pin.is_empty());
+        app.emv = Some("Synthetic information".to_owned());
+        app.change_mode(CardMode::Sle4428);
+        assert!(app.emv.is_none());
+    }
+
+    #[test]
+    fn emv_worker_output_is_masked_and_errors_clear_it() {
+        let info = emv::CardInformation::from_tlv(&[0x5A, 4, 0x12, 0x34, 0x56, 0x78]).unwrap();
+        let report = emv_report(&[emv::ApplicationInformation {
+            aid: vec![0xA0, 0, 0, 0, 3],
+            information: info,
+        }])
+        .unwrap();
+        assert!(report.contains("Card number (masked)"));
+        assert!(report.contains("5678"));
+        assert!(!report.contains("12345678"));
+        let (sender, receiver) = mpsc::channel();
+        let mut app = CardApp {
+            mode: CardMode::Emv,
+            worker: Some(receiver),
+            ..Default::default()
+        };
+        sender.send(Ok(Output::Emv(report))).unwrap();
+        app.poll();
+        assert!(app.emv.is_some());
+        assert!(app.worker.is_none());
+        let (sender, receiver) = mpsc::channel();
+        app.worker = Some(receiver);
+        sender
+            .send(Err(io::Error::other("Synthetic EMV failure")))
+            .unwrap();
+        app.poll();
+        assert!(app.emv.is_none());
+        assert!(app.error.unwrap().contains("Synthetic EMV failure"));
+    }
+
+    #[test]
+    fn emv_ui_shows_information_without_memory_write_controls() {
+        let mut app = CardApp {
+            mode: CardMode::Emv,
+            emv: Some("Synthetic EMV information".to_owned()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 1400.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input.clone(), |ctx| app.ui(ctx));
+        let output = ctx.run(input, |ctx| app.ui(ctx));
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some(text.galley.job.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for label in [
+            "AID (hex, optional)",
+            "Read EMV",
+            "EMV information",
+            "Synthetic EMV information",
+        ] {
+            assert!(labels.contains(&label), "Missing {label}");
+        }
+        for label in [
+            "HID DLL",
+            "PIN (hex)",
+            "Review write...",
+            "Preview address (hex)",
+        ] {
+            assert!(!labels.contains(&label), "Unexpected {label}");
+        }
+        assert!(app.worker.is_none());
+    }
 
     #[test]
     fn string_writes_count_utf8_bytes_and_enforce_security_boundaries() {

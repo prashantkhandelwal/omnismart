@@ -121,9 +121,10 @@ It does not read vehicle-registration files or infer PANs from Track 2.
 
 ## Desktop GUI (egui)
 
-The optional native GUI reads and writes **SLE4428 memory cards** using the
-same library safeguards as the CLI. EMV remains available through the
-existing CLI/library; the GUI does not send EMV commands.
+The optional native GUI reads and writes **SLE4428 memory cards** and reads
+**EMV application information**, using the same library safeguards as the CLI.
+Choose the card mode at the top. EMV mode is read-only and hides all memory-write
+and PIN controls.
 
 ```powershell
 cargo run --features gui --bin omnismart-gui
@@ -136,16 +137,19 @@ cargo build --release --features gui --bin omnismart-gui
 .\target\release\omnismart-gui.exe
 ```
 
-Windows, a compatible reader driver, and HID's Synchronous-API DLL are still
+For SLE4428, Windows, a compatible reader driver, and HID's Synchronous-API DLL are still
 required (see the SLE4428 prerequisites below). The GUI suggests the Windows
 system-directory DLL path; change it if your trusted HID installation differs.
 The DLL must match the executable architecture.
+EMV mode uses standard PC/SC access and does not load or require the HID DLL.
 
 All card inputs and selections are grouped at the top. The hex and readable
 string panels fill the area below; explanatory prose is omitted from the main
 window. Field labels, status/errors, and destructive-write confirmation remain.
 
-1. Click **Refresh readers**, then select the intended reader.
+### SLE4428 mode
+
+1. Select **SLE4428**, click **Refresh readers**, then select the intended reader.
 2. Check the trusted DLL path and click **Read memory** to display all 1024
    bytes as hex in **Read snapshot**. The **Readable string** panel to its right
    displays UTF-8 text for an explicit hex address and decimal byte length.
@@ -181,7 +185,24 @@ bytes, not printable spaces.
 Reader discovery and card I/O run off the UI thread, one operation at a time.
 The GUI prevents normal window closure while I/O is pending. Do not remove the
 card, disconnect the reader, or force-terminate the app during a write. Read
-snapshots are cleared when the reader/DLL changes or another operation starts.
+snapshots are cleared when the card mode, reader, DLL, or EMV AID changes, or
+another operation starts.
+
+### EMV mode
+
+Select **EMV (read-only)**, click **Refresh readers**, select your reader, and
+click **Read EMV**. Leave **AID (hex, optional)** blank to discover advertised
+applications, or supply your card's documented 5-to-16-byte AID without spaces.
+The information panel displays each application's AID, network, label, masked
+card number, dates, and other available standard fields. Missing fields are
+shown as not provided; full PAN, Track 2, and raw APDU responses are not displayed.
+
+This mode sends SELECT, GET PROCESSING OPTIONS (GPO), and advertised standard
+READ RECORD commands. GPO may affect card counters; no PIN verification,
+payment authorization, or card-write commands are sent. Applications requiring
+nonempty PDOL terminal data are not supported and produce an explicit error.
+Nothing is read automatically when switching modes. Keep the display private:
+names and other personal data may still be exposed by the card.
 
 **Privacy:** Keep the window private: memory, text, and hex data are visible.
 The application does not save PINs/card data, persist form state, or print raw
