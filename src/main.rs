@@ -1,4 +1,4 @@
-use omnismart::{ReaderContext, dump, emv, select_reader};
+use omnismart::{ReaderContext, dump, emv, select_reader, sle4428};
 use std::{error::Error, io, path::Path, process::ExitCode};
 
 fn main() -> ExitCode {
@@ -16,9 +16,28 @@ struct Arguments<'a> {
     aid: Option<Vec<u8>>,
     dump_path: Option<&'a Path>,
     show_pan: bool,
+    sync_api_path: Option<&'a Path>,
 }
 
 fn parse_arguments(arguments: &[String]) -> io::Result<Arguments<'_>> {
+    if let [mode, option, path] = arguments
+        && mode == "--sle4428"
+        && option == "--sync-api"
+    {
+        let path = Path::new(path);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--sync-api requires an absolute path to HID's trusted scardsyn.dll.",
+            ));
+        }
+        return Ok(Arguments {
+            aid: None,
+            dump_path: None,
+            show_pan: false,
+            sync_api_path: Some(path),
+        });
+    }
     let (aid, dump_path, show_pan) = match arguments {
         [] => (None, None, false),
         [mode] if mode == "--emv" || mode == "--info" => (None, None, false),
@@ -50,6 +69,7 @@ fn parse_arguments(arguments: &[String]) -> io::Result<Arguments<'_>> {
                 "Usage: omnismart [--emv [--aid HEX]] or \
                  omnismart --info [--aid HEX] [--show-pan] or \
                  omnismart --dump PATH [--aid HEX]. --show-pan requires --info. \
+                 For SLE4428: omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH. \
                  Use --help for details.",
             ));
         }
@@ -58,6 +78,7 @@ fn parse_arguments(arguments: &[String]) -> io::Result<Arguments<'_>> {
         aid,
         dump_path,
         show_pan,
+        sync_api_path: None,
     })
 }
 
@@ -67,6 +88,7 @@ fn read_card() -> Result<(), Box<dyn Error>> {
         println!("Usage: omnismart [--emv [--aid HEX]]");
         println!("       omnismart --info [--aid HEX] [--show-pan]");
         println!("       omnismart --dump PATH [--aid HEX]");
+        println!("       omnismart --sle4428 --sync-api ABSOLUTE_DLL_PATH");
         println!("Without arguments: read the ATR only.");
         println!("--emv: print raw EMV directory and application-selection responses.");
         println!("--info: read general information and cardholder name, if exposed.");
@@ -75,6 +97,16 @@ fn read_card() -> Result<(), Box<dyn Error>> {
         println!("--dump includes GPO and AFL records, not protected or unadvertised memory.");
         println!("--aid HEX: select a documented application ID instead of discovering it.");
         println!("--show-pan: with --info only, display the full PAN if tag 5A is readable.");
+        println!(
+            "--sle4428: read 1024 main-memory bytes as hex using HID's Windows Synchronous-API."
+        );
+        println!(
+            "--sync-api: absolute path to a trusted HID scardsyn.dll matching this executable."
+        );
+        println!(
+            "SLE4428 mode cannot be combined with EMV options; it does not change reader settings."
+        );
+        println!("WARNING: SLE4428 output is raw card data. Keep output private.");
         println!("WARNING: --show-pan exposes the full card number. Keep output private.");
         println!("WARNING: EMV output may contain sensitive bank-card data. Do not share it.");
         return Ok(());
@@ -83,7 +115,11 @@ fn read_card() -> Result<(), Box<dyn Error>> {
         aid,
         dump_path,
         show_pan,
+        sync_api_path,
     } = parse_arguments(&arguments)?;
+    let sync_api = sync_api_path
+        .map(sle4428::SynchronousApi::load)
+        .transpose()?;
     let read_emv = !arguments.is_empty();
     let information = arguments.first().is_some_and(|mode| mode == "--info");
     let context = ReaderContext::establish()?;
@@ -96,6 +132,20 @@ fn read_card() -> Result<(), Box<dyn Error>> {
     let reader = select_reader(&readers)?;
 
     println!("Connecting through: {}", reader.to_string_lossy());
+    if let Some(api) = sync_api {
+        println!("WARNING: Raw SLE4428 memory may contain sensitive data. Keep output private.");
+        println!("Read-only mode: no PIN attempts, writes, or reader configuration changes.");
+        let memory = api.read(reader)?;
+        println!("SLE4428 main memory ({} bytes):", memory.len());
+        for (row, bytes) in memory.chunks(16).enumerate() {
+            print!("{:04X}:", row * 16);
+            for byte in bytes {
+                print!(" {byte:02X}");
+            }
+            println!();
+        }
+        return Ok(());
+    }
     let mut card = context.connect(reader)?;
     let status = card.status()?;
 
@@ -192,10 +242,12 @@ mod tests {
         let arguments: Vec<String> = arguments.iter().map(|value| value.to_string()).collect();
         let parsed = parse_arguments(&arguments)?;
         assert!(parsed.dump_path.is_none());
+        assert!(parsed.sync_api_path.is_none());
         Ok(Arguments {
             aid: parsed.aid,
             dump_path: None,
             show_pan: parsed.show_pan,
+            sync_api_path: None,
         })
     }
 
@@ -251,6 +303,25 @@ mod tests {
             let parsed = parse_arguments(&arguments).unwrap();
             assert_eq!(parsed.dump_path, Some(Path::new("synthetic.json")));
             assert!(!parsed.show_pan);
+        }
+    }
+
+    #[test]
+    fn synchronous_mode_is_explicit_and_separate_from_emv() {
+        let path = std::env::temp_dir().join("scardsyn.dll");
+        let arguments = vec![
+            "--sle4428".to_owned(),
+            "--sync-api".to_owned(),
+            path.to_string_lossy().into_owned(),
+        ];
+        let parsed = parse_arguments(&arguments).unwrap();
+        assert_eq!(parsed.sync_api_path, Some(path.as_path()));
+        assert!(parsed.aid.is_none());
+        assert!(parsed.dump_path.is_none());
+        assert!(!parsed.show_pan);
+
+        for arguments in [vec![], vec!["--emv"], vec!["--info"]] {
+            assert!(parse(&arguments).unwrap().sync_api_path.is_none());
         }
     }
 }

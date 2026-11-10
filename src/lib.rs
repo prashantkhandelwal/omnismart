@@ -17,6 +17,7 @@
 
 pub mod dump;
 pub mod emv;
+pub mod sle4428;
 
 pub use pcsc::Protocol;
 use pcsc::{Context, Protocols, Scope, ShareMode};

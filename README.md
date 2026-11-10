@@ -4,6 +4,8 @@ A Rust PC/SC library and CLI for the HID OMNIKEY 3021 contact smart-card reader.
 The CLI lists connected readers, connects to the first OMNIKEY 3021, and prints
 the card protocol and ATR (Answer To Reset). The library also allows connecting
 to an explicitly selected PC/SC reader.
+An independent, opt-in Windows mode reads SLE4428 memory through HID's
+Synchronous-API; existing ATR and EMV modes do not require or load that API.
 
 ## Using the Rust library
 
@@ -39,6 +41,9 @@ Public API:
 - `ReaderContext::connect` accepts an explicit reader name, including non-OMNIKEY
   readers; `connect_preferred` discovers and selects an OMNIKEY automatically.
 - `CardConnection::status` returns owned `CardStatus` metadata.
+- `sle4428::SynchronousApi::load` loads an explicitly selected HID DLL on Windows.
+  Its `read` method accepts a PC/SC reader name and returns all 1024 main-memory
+  bytes without printing, writing, PIN attempts, or reader configuration changes.
 - `CardConnection::with_transaction` supplies a raw APDU transport closure,
   ends exclusive access with `LeaveCard`, and preserves operation/cleanup errors.
 - `emv::parse_aid`, `read_directory`, `read_information`, and `read_dump` expose
@@ -168,6 +173,53 @@ exit code.
 
 An ATR is not a card's stored application data or necessarily a unique card ID.
 There is no universal "read all data" APDU.
+
+### SLE4428 memory cards (Windows, OMNIKEY 3021)
+
+SLE4428 is a three-wire synchronous memory card, not an EMV payment card.
+Use its dedicated mode rather than `--info`, `--emv`, or `--dump`:
+
+```powershell
+# Replace this example path with your trusted HID Synchronous-API installation.
+cargo run -- --sle4428 --sync-api "C:\HID\Synchronous-API\x64\scardsyn.dll"
+```
+
+Prerequisites:
+
+- Install the model-compatible HID OMNIKEY driver with synchronous-card support.
+  The generic Microsoft CCID driver may not provide the required support.
+- Obtain HID's [Synchronous-API package](https://www.hidglobal.com/drivers/29915).
+  Supply an **absolute path** to its authentic `scardsyn.dll`. Loading a DLL
+  executes native code: do not use untrusted downloads.
+- Match the DLL architecture to the executable (normally x64 on 64-bit Windows).
+  A 32-bit DLL requires a 32-bit executable; it cannot be loaded by an x64 build.
+- Insert your own SLE4428 with the contacts correctly oriented.
+
+The mode uses HID's `SCard3WBPReadData` to read main memory, addresses
+`0000` through `03FF`, and prints 64 rows of 16 hexadecimal bytes. It checks
+the driver's three-wire ATR type first; this identifies a compatible family,
+not an authenticated chip identity (SLE4418 is also compatible). Native read
+failures return an error instead of printing partial or zero-filled memory.
+This mode does not decode application fields, read protection bits, attempt
+PIN verification, write memory, or change reader settings. Raw memory can
+contain sensitive data: keep terminal output private.
+
+**If you still see "The smart card is not responding to a reset":** the
+driver must initialize the card before the synchronous API can read it.
+Loading the DLL does not bypass this prerequisite. Check orientation and
+contacts, install/check the HID driver, and test with the SDK's **Read Memory**
+tool. HID's [Synchronous-API guide](https://www.hidglobal.com/documents/omnikey-synchronous-api-software-developer-guide)
+also discusses voltage-selection issues for AVR-based readers. This program
+deliberately does **not** apply those configuration changes automatically,
+so existing reader configuration and EMV behavior are preserved.
+
+SLE4428 mode cannot be combined with EMV options. No automatic fallback or
+card-type guessing is performed. Existing commands (`cargo run`, `--info`,
+`--emv`, `--aid`, `--show-pan`, and `--dump`) retain their behavior and do not
+require the HID DLL. The SLE4428 backend is Windows-only; other platforms
+return an explicit unsupported-platform error.
+
+### EMV payment cards
 
 For your own EMV bank card, opt in to printing raw directory records and
 application-selection responses:
@@ -342,5 +394,9 @@ Unit tests cover reader selection, AID validation, TLV parsing, directory
 discovery, APDU response handling, raw JSON persistence, incomplete dumps, and
 overwrite protection with synthetic data. Verifying a real card connection
 requires the reader and a compatible inserted card.
+SLE4428 tests cover mode isolation, DLL-path validation, ATR-family checks,
+native read size/address, and explicit native errors using a synthetic API
+function. Real SLE4428 reset/driver/DLL compatibility and memory contents
+must still be verified with the reader, vendor software, and card.
 
 API documentation: https://docs.rs/pcsc/latest/pcsc/
