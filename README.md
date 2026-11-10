@@ -195,7 +195,11 @@ click **Read EMV**. Leave **AID (hex, optional)** blank to discover advertised
 applications, or supply your card's documented 5-to-16-byte AID without spaces.
 The information panel displays each application's AID, network, label, masked
 card number, dates, and other available standard fields. Missing fields are
-shown as not provided; full PAN, Track 2, and raw APDU responses are not displayed.
+shown as not provided. **Show full PAN** is unchecked by default; check it and
+click **Read EMV** to explicitly display the full card number if the card provides
+one. Changing the checkbox clears the current result; read again to apply the
+new setting. Switching card modes resets it to unchecked. Track 2 and raw APDU
+responses are never displayed. Keep full PAN output private.
 
 This mode sends SELECT, GET PROCESSING OPTIONS (GPO), and advertised standard
 READ RECORD commands. GPO may affect card counters; no PIN verification,

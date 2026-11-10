@@ -52,6 +52,7 @@ enum Operation {
     ReadEmv {
         reader: CString,
         aid: Option<Vec<u8>>,
+        show_pan: bool,
     },
     Write(WriteJob),
 }
@@ -69,13 +70,16 @@ fn execute(operation: Operation) -> io::Result<Output> {
         Operation::Read { reader, dll } => Ok(Output::Memory(Box::new(
             SynchronousApi::load(&dll)?.read(&reader)?,
         ))),
-        Operation::ReadEmv { reader, aid } => {
+        Operation::ReadEmv {
+            reader,
+            aid,
+            show_pan,
+        } => {
             let context = ReaderContext::establish()?;
             let mut card = context.connect(&reader)?;
-            let applications = card.with_transaction(|transmit| {
-                emv::read_card_information(transmit, aid.as_deref())
-            })?;
-            Ok(Output::Emv(emv_report(&applications)?))
+            let report =
+                card.with_transaction(|transmit| emv_report(transmit, aid.as_deref(), show_pan))?;
+            Ok(Output::Emv(report))
         }
         Operation::Write(job) => {
             SynchronousApi::load(&job.dll)?.write(&job.reader, &job.request, job.pin)?;
@@ -87,13 +91,13 @@ fn execute(operation: Operation) -> io::Result<Output> {
     }
 }
 
-fn emv_report(applications: &[emv::ApplicationInformation]) -> io::Result<String> {
+fn emv_report(
+    transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    aid: Option<&[u8]>,
+    show_pan: bool,
+) -> io::Result<String> {
     let mut buffer = Vec::new();
-    for application in applications {
-        application
-            .information
-            .render_information(&application.aid, &mut buffer)?;
-    }
+    emv::read_information_to(transmit, aid, show_pan, &mut buffer)?;
     String::from_utf8(buffer).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
@@ -140,6 +144,7 @@ fn text_preview<'a>(memory: &'a [u8], address: &str, length: &str) -> io::Result
 }
 
 struct CardApp {
+    show_pan: bool,
     mode: CardMode,
     aid: String,
     emv: Option<String>,
@@ -178,6 +183,7 @@ impl Default for CardApp {
             String::new()
         };
         Self {
+            show_pan: false,
             mode: CardMode::Sle4428,
             aid: String::new(),
             emv: None,
@@ -230,6 +236,7 @@ impl CardApp {
             }
             CardMode::Emv => Ok(Operation::ReadEmv {
                 reader: self.reader()?,
+                show_pan: self.show_pan,
                 aid: if self.aid.trim().is_empty() {
                     None
                 } else {
@@ -244,9 +251,18 @@ impl CardApp {
         self.emv = None;
     }
 
+    fn set_show_pan(&mut self, show_pan: bool) {
+        if self.show_pan != show_pan {
+            self.show_pan = show_pan;
+            self.clear_snapshot();
+            self.status = "Click Read EMV to apply PAN visibility.".to_owned();
+        }
+    }
+
     fn change_mode(&mut self, mode: CardMode) {
         if self.mode != mode {
             self.mode = mode;
+            self.show_pan = false;
             self.clear_snapshot();
             self.pin.clear();
             self.status.clear();
@@ -379,19 +395,19 @@ impl CardApp {
                 });
                 self.change_mode(mode);
                 if self.mode == CardMode::Sle4428 {
-                ui.horizontal(|ui| {
-                    ui.label("HID DLL");
-                    if ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.dll)
-                                .desired_width(ui.available_width()),
-                        )
-                        .changed()
-                    {
-                        self.clear_snapshot();
-                        self.pin.clear();
-                    }
-                });
+                    ui.horizontal(|ui| {
+                        ui.label("HID DLL");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.dll)
+                                    .desired_width(ui.available_width()),
+                            )
+                            .changed()
+                        {
+                            self.clear_snapshot();
+                            self.pin.clear();
+                        }
+                    });
                 } else {
                     ui.horizontal(|ui| {
                         ui.label("AID (hex, optional)");
@@ -399,7 +415,16 @@ impl CardApp {
                             self.clear_snapshot();
                         }
                     });
-                    ui.small("PAN masked. GPO may affect card counters; no PIN or payment authorization.");
+                    let mut show_pan = self.show_pan;
+                    ui.checkbox(&mut show_pan, "Show full PAN");
+                    self.set_show_pan(show_pan);
+                    if self.show_pan {
+                        ui.colored_label(
+                            egui::Color32::RED,
+                            "Full PAN enabled. Keep the display private.",
+                        );
+                    }
+                    ui.small("GPO may affect card counters; no PIN or payment authorization.");
                 }
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Refresh readers").clicked() {
@@ -429,8 +454,18 @@ impl CardApp {
                         self.clear_snapshot();
                         self.pin.clear();
                     }
-                    let read_label = if self.mode == CardMode::Emv { "Read EMV" } else { "Read memory" };
-                    if ui.add_enabled(self.mode == CardMode::Emv || cfg!(windows), egui::Button::new(read_label)).clicked() {
+                    let read_label = if self.mode == CardMode::Emv {
+                        "Read EMV"
+                    } else {
+                        "Read memory"
+                    };
+                    if ui
+                        .add_enabled(
+                            self.mode == CardMode::Emv || cfg!(windows),
+                            egui::Button::new(read_label),
+                        )
+                        .clicked()
+                    {
                         match self.read_operation() {
                             Ok(operation) => self.start(operation, ctx),
                             Err(error) => self.error = Some(error.to_string()),
@@ -438,73 +473,78 @@ impl CardApp {
                     }
                 });
                 if self.mode == CardMode::Sle4428 {
-                ui.add_enabled_ui(cfg!(windows), |ui| {
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Write address (hex)");
-                    ui.add(egui::TextEdit::singleline(&mut self.address).desired_width(80.0));
-                    ui.radio_value(&mut self.encoding, Encoding::Text, "UTF-8 text");
-                    ui.radio_value(&mut self.encoding, Encoding::Hex, "Hex bytes");
-                    if ui
-                        .checkbox(&mut self.replace, "Replace through 03FC")
-                        .changed()
-                        && self.replace
-                    {
-                        self.field_length.clear();
-                    }
-                    ui.add_enabled_ui(!self.replace, |ui| {
-                        ui.label("Field length (bytes)");
+                    ui.add_enabled_ui(cfg!(windows), |ui| {
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Write address (hex)");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.address).desired_width(80.0),
+                            );
+                            ui.radio_value(&mut self.encoding, Encoding::Text, "UTF-8 text");
+                            ui.radio_value(&mut self.encoding, Encoding::Hex, "Hex bytes");
+                            if ui
+                                .checkbox(&mut self.replace, "Replace through 03FC")
+                                .changed()
+                                && self.replace
+                            {
+                                self.field_length.clear();
+                            }
+                            ui.add_enabled_ui(!self.replace, |ui| {
+                                ui.label("Field length (bytes)");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.field_length)
+                                        .desired_width(80.0),
+                                );
+                            });
+                        });
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.field_length).desired_width(80.0),
+                            egui::TextEdit::multiline(&mut self.data)
+                                .hint_text("Data")
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY),
                         );
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("PIN (hex)");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.pin)
+                                    .password(true)
+                                    .desired_width(100.0),
+                            );
+                            if ui.button("Review write...").clicked()
+                                && let Err(error) = self.review()
+                            {
+                                self.pin.clear();
+                                self.error = Some(error.to_string());
+                            }
+                            if !self.data.is_empty() {
+                                match self.write_request() {
+                                    Ok(request) => {
+                                        ui.small(format!(
+                                            "{} bytes / {} available; {} zero-fill",
+                                            request.data().len(),
+                                            WRITE_LIMIT - request.address() as usize,
+                                            request.padding_len()
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        ui.colored_label(egui::Color32::RED, error.to_string());
+                                    }
+                                }
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Preview address (hex)");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.preview_address)
+                                    .desired_width(70.0),
+                            );
+                            ui.label("Preview length (bytes)");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.preview_length)
+                                    .desired_width(70.0),
+                            );
+                        });
                     });
-                });
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.data)
-                        .hint_text("Data")
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("PIN (hex)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.pin)
-                            .password(true)
-                            .desired_width(100.0),
-                    );
-                    if ui.button("Review write...").clicked()
-                        && let Err(error) = self.review()
-                    {
-                        self.pin.clear();
-                        self.error = Some(error.to_string());
-                    }
-                    if !self.data.is_empty() {
-                        match self.write_request() {
-                            Ok(request) => {
-                                ui.small(format!(
-                                    "{} bytes / {} available; {} zero-fill",
-                                    request.data().len(),
-                                    WRITE_LIMIT - request.address() as usize,
-                                    request.padding_len()
-                                ));
-                            }
-                            Err(error) => {
-                                ui.colored_label(egui::Color32::RED, error.to_string());
-                            }
-                        }
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Preview address (hex)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.preview_address).desired_width(70.0),
-                    );
-                    ui.label("Preview length (bytes)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.preview_length).desired_width(70.0),
-                    );
-                });
-                });
                 }
             });
         });
@@ -656,6 +696,85 @@ impl eframe::App for CardApp {
 mod tests {
     use super::*;
 
+    fn synthetic_emv_report(show_pan: bool) -> String {
+        let mut responses = vec![
+            vec![
+                0x6F, 12, 0x5A, 4, 0x12, 0x34, 0x56, 0x78, 0x57, 4, 0x11, 0x22, 0x33, 0x44, 0x90, 0,
+            ],
+            vec![0x80, 2, 0, 0, 0x90, 0],
+        ]
+        .into_iter();
+        let report = emv_report(
+            |_| Ok(responses.next().unwrap()),
+            Some(&[0xA0, 0, 0, 0, 3]),
+            show_pan,
+        )
+        .unwrap();
+        assert!(responses.next().is_none());
+        report
+    }
+
+    #[test]
+    fn full_pan_is_opt_in_and_visibility_changes_discard_results() {
+        let mut app = CardApp {
+            mode: CardMode::Emv,
+            readers: vec![CString::new("Synthetic reader").unwrap()],
+            selected: Some(0),
+            emv: Some(synthetic_emv_report(false)),
+            ..Default::default()
+        };
+        assert!(!app.show_pan);
+        assert!(matches!(
+            app.read_operation().unwrap(),
+            Operation::ReadEmv {
+                show_pan: false,
+                ..
+            }
+        ));
+        app.set_show_pan(true);
+        assert!(app.emv.is_none());
+        assert!(app.status.contains("Read EMV"));
+        assert!(matches!(
+            app.read_operation().unwrap(),
+            Operation::ReadEmv { show_pan: true, .. }
+        ));
+        let report = synthetic_emv_report(true);
+        assert!(report.contains("Card number (full)"));
+        assert!(report.contains("12345678"));
+        assert!(!report.contains("11223344"));
+        app.emv = Some(report);
+        app.set_show_pan(false);
+        assert!(app.emv.is_none());
+        assert!(!app.show_pan);
+        app.set_show_pan(true);
+        app.change_mode(CardMode::Sle4428);
+        assert!(!app.show_pan);
+        app.change_mode(CardMode::Emv);
+        assert!(!app.show_pan);
+    }
+
+    #[test]
+    fn full_pan_report_handles_missing_pan_and_propagates_errors() {
+        let mut responses = vec![vec![0x6F, 0, 0x90, 0], vec![0x80, 2, 0, 0, 0x90, 0]].into_iter();
+        let report = emv_report(
+            |_| Ok(responses.next().unwrap()),
+            Some(&[0xA0, 0, 0, 0, 3]),
+            true,
+        )
+        .unwrap();
+        let row = report
+            .lines()
+            .find(|line| line.contains("Card number (full)"))
+            .unwrap();
+        assert!(row.contains("Not provided"));
+        assert!(
+            emv_report(|_| Err(io::Error::other("Synthetic error")), None, true)
+                .unwrap_err()
+                .to_string()
+                .contains("Synthetic error")
+        );
+    }
+
     #[test]
     fn emv_mode_needs_no_dll_and_rejects_writes_and_invalid_aids() {
         let mut app = CardApp {
@@ -671,7 +790,7 @@ mod tests {
         ));
         app.aid = "A000000003".to_owned();
         match app.read_operation().unwrap() {
-            Operation::ReadEmv { aid, reader } => {
+            Operation::ReadEmv { aid, reader, .. } => {
                 assert_eq!(aid.unwrap(), [0xA0, 0, 0, 0, 3]);
                 assert_eq!(reader, app.readers[0]);
             }
@@ -705,12 +824,7 @@ mod tests {
 
     #[test]
     fn emv_worker_output_is_masked_and_errors_clear_it() {
-        let info = emv::CardInformation::from_tlv(&[0x5A, 4, 0x12, 0x34, 0x56, 0x78]).unwrap();
-        let report = emv_report(&[emv::ApplicationInformation {
-            aid: vec![0xA0, 0, 0, 0, 3],
-            information: info,
-        }])
-        .unwrap();
+        let report = synthetic_emv_report(false);
         assert!(report.contains("Card number (masked)"));
         assert!(report.contains("5678"));
         assert!(!report.contains("12345678"));
@@ -764,6 +878,7 @@ mod tests {
             .collect();
         for label in [
             "AID (hex, optional)",
+            "Show full PAN",
             "Read EMV",
             "EMV information",
             "Synthetic EMV information",

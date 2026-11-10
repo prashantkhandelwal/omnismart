@@ -450,9 +450,44 @@ pub struct ApplicationInformation {
 /// GPO may affect card counters. Required nonempty PDOLs are unsupported.
 /// Any application error fails the read rather than returning an incomplete list.
 pub fn read_card_information(
-    mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     explicit_aid: Option<&[u8]>,
 ) -> io::Result<Vec<ApplicationInformation>> {
+    read_card_information_inner(transmit, explicit_aid, false).map(|applications| {
+        applications
+            .into_iter()
+            .map(|(application, _)| application)
+            .collect()
+    })
+}
+
+/// Reads application information into a caller-provided writer without console output.
+///
+/// Uses the same commands and restrictions as [`read_card_information`].
+/// `show_pan` explicitly opts into full PAN output; keep the resulting text private.
+/// Track 2 and raw APDU responses are never written.
+pub fn read_information_to(
+    transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    explicit_aid: Option<&[u8]>,
+    show_pan: bool,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    for (application, pan) in read_card_information_inner(transmit, explicit_aid, show_pan)? {
+        application.information.render_information_inner(
+            &application.aid,
+            output,
+            show_pan,
+            pan.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn read_card_information_inner(
+    mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    explicit_aid: Option<&[u8]>,
+    show_pan: bool,
+) -> io::Result<Vec<(ApplicationInformation, Option<String>)>> {
     let aids = if let Some(aid) = explicit_aid {
         validate_aid(aid)?;
         vec![aid.to_vec()]
@@ -463,9 +498,9 @@ pub fn read_card_information(
         .map(|aid| {
             let response = select(&mut transmit, &aid)?;
             require_success(&response, "Application SELECT")?;
-            let (information, _) =
-                read_application_information_inner(&mut transmit, &response.data, false, false)?;
-            Ok(ApplicationInformation { aid, information })
+            let (information, pan) =
+                read_application_information_inner(&mut transmit, &response.data, show_pan, false)?;
+            Ok((ApplicationInformation { aid, information }, pan))
         })
         .collect()
 }
