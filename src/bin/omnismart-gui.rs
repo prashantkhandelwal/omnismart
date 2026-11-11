@@ -8,6 +8,7 @@ use omnismart::{
 use std::{
     ffi::CString,
     io,
+    ops::Range,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver, TryRecvError},
     time::Duration,
@@ -111,7 +112,7 @@ fn write_request(address: &str, data: &str, encoding: Encoding) -> io::Result<Wr
     WriteRequest::new(address, bytes)
 }
 
-fn text_preview<'a>(memory: &'a [u8], address: &str, length: &str) -> io::Result<&'a str> {
+fn text_preview<'a>(memory: &'a [u8], address: &str, length: &str) -> io::Result<(usize, &'a str)> {
     let address = usize::from_str_radix(address.strip_prefix("0x").unwrap_or(address), 16)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Preview address must be hex."))?;
     let length: usize = length.parse().map_err(|_| {
@@ -135,12 +136,186 @@ fn text_preview<'a>(memory: &'a [u8], address: &str, length: &str) -> io::Result
                 "Choose a nonempty preview range within 0000..03FF.",
             )
         })?;
-    std::str::from_utf8(bytes).map_err(|_| {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "This range is not valid UTF-8 text. Use the hex view or adjust the range.",
         )
-    })
+    })?;
+    Ok((address, text))
+}
+
+struct SnapshotText {
+    text: String,
+    bytes: Vec<Option<Range<usize>>>,
+}
+
+impl SnapshotText {
+    fn hex(memory: &[u8]) -> Self {
+        let mut result = Self {
+            text: String::new(),
+            bytes: Vec::new(),
+        };
+        for (row, bytes) in memory.chunks(16).enumerate() {
+            if row > 0 {
+                result.text.push('\n');
+                result.bytes.push(None);
+            }
+            let prefix = format!("{:04X}: ", row * 16);
+            result.bytes.extend(std::iter::repeat_n(None, prefix.len()));
+            result.text.push_str(&prefix);
+            for (column, byte) in bytes.iter().enumerate() {
+                if column > 0 {
+                    result.text.push(' ');
+                    result.bytes.push(None);
+                }
+                let address = row * 16 + column;
+                result.text.push_str(&format!("{byte:02X}"));
+                result
+                    .bytes
+                    .extend(std::iter::repeat_n(Some(address..address + 1), 2));
+            }
+        }
+        result
+    }
+
+    fn readable(address: usize, text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            bytes: text
+                .char_indices()
+                .map(|(index, ch)| Some(address + index..address + index + ch.len_utf8()))
+                .collect(),
+        }
+    }
+
+    fn selected_bytes(&self, characters: Range<usize>) -> Option<Range<usize>> {
+        let mut ranges = self.bytes[characters].iter().flatten();
+        let first = ranges.next()?;
+        let end = ranges.last().unwrap_or(first).end;
+        Some(first.start..end)
+    }
+
+    fn clicked_hex_characters(
+        &self,
+        galley: &egui::Galley,
+        position: egui::Vec2,
+    ) -> Option<Range<usize>> {
+        let cursor = galley.cursor_from_pos(position);
+        let caret = galley.pos_from_cursor(cursor);
+        let index = if position.x < caret.left() {
+            cursor.index.checked_sub(1)?
+        } else {
+            cursor.index
+        };
+        let start = galley.pos_from_cursor(egui::text::CCursor::new(index));
+        let end = galley.pos_from_cursor(egui::text::CCursor::new(index + 1));
+        let bounds = egui::Rect::from_min_max(start.left_top(), end.left_bottom());
+        if !bounds.contains(position.to_pos2()) {
+            return None;
+        }
+        let byte = self.bytes.get(index)?.as_ref()?;
+        let first = if index > 0 && self.bytes[index - 1].as_ref() == Some(byte) {
+            index - 1
+        } else {
+            index
+        };
+        Some(first..first + 2)
+    }
+
+    fn layout(
+        &self,
+        font_id: egui::FontId,
+        color: egui::Color32,
+        background: egui::Color32,
+        selection: Option<&Range<usize>>,
+        wrap_width: f32,
+    ) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap_width;
+        for (ch, bytes) in self.text.chars().zip(&self.bytes) {
+            let selected = bytes.as_ref().is_some_and(|bytes| {
+                selection.is_some_and(|selection| {
+                    bytes.start < selection.end && selection.start < bytes.end
+                })
+            });
+            job.append(
+                ch.encode_utf8(&mut [0; 4]),
+                0.0,
+                egui::TextFormat {
+                    font_id: font_id.clone(),
+                    color,
+                    background: if selected {
+                        background
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        job
+    }
+}
+
+fn snapshot_view(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash,
+    snapshot: &SnapshotText,
+    selection: &mut Option<Range<usize>>,
+    wrap: bool,
+) -> egui::text_edit::TextEditOutput {
+    let font = if wrap {
+        egui::TextStyle::Body
+    } else {
+        egui::TextStyle::Monospace
+    };
+    let mut layouter = |ui: &egui::Ui, _: &dyn egui::TextBuffer, width: f32| {
+        let job = snapshot.layout(
+            font.resolve(ui.style()),
+            ui.visuals().text_color(),
+            ui.visuals().selection.bg_fill,
+            selection.as_ref(),
+            if wrap { width } else { f32::INFINITY },
+        );
+        ui.fonts_mut(|fonts| fonts.layout_job(job))
+    };
+    let mut text = snapshot.text.as_str();
+    let mut output = egui::TextEdit::multiline(&mut text)
+        .id_salt(id)
+        .font(font.clone())
+        .frame(false)
+        .desired_rows(1)
+        .desired_width(if wrap { f32::INFINITY } else { 0.0 })
+        .layouter(&mut layouter)
+        .show(ui);
+    if !wrap
+        && output.response.clicked_by(egui::PointerButton::Primary)
+        && !output.response.double_clicked()
+        && !output.response.triple_clicked()
+        && !ui.input(|input| input.modifiers.shift)
+        && let Some(position) = output.response.interact_pointer_pos()
+        && let Some(characters) =
+            snapshot.clicked_hex_characters(&output.galley, position - output.galley_pos)
+    {
+        let cursor = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(characters.start),
+            egui::text::CCursor::new(characters.end),
+        );
+        output.cursor_range = Some(cursor);
+        output.state.cursor.set_char_range(Some(cursor));
+        output.state.clone().store(ui.ctx(), output.response.id);
+    }
+    if output.response.has_focus()
+        && let Some(cursor) = output.cursor_range
+    {
+        let next = snapshot.selected_bytes(cursor.as_sorted_char_range());
+        if *selection != next {
+            *selection = next;
+            ui.ctx().request_repaint();
+        }
+    }
+    output
 }
 
 struct CardApp {
@@ -152,6 +327,7 @@ struct CardApp {
     readers: Vec<CString>,
     selected: Option<usize>,
     memory: Option<Box<[u8; MEMORY_SIZE]>>,
+    snapshot_selection: Option<Range<usize>>,
     address: String,
     data: String,
     field_length: String,
@@ -191,6 +367,7 @@ impl Default for CardApp {
             readers: Vec::new(),
             selected: None,
             memory: None,
+            snapshot_selection: None,
             address: "0020".to_owned(),
             data: String::new(),
             field_length: String::new(),
@@ -248,6 +425,7 @@ impl CardApp {
 
     fn clear_snapshot(&mut self) {
         self.memory = None;
+        self.snapshot_selection = None;
         self.emv = None;
     }
 
@@ -583,26 +761,27 @@ impl CardApp {
                     columns[0].heading("Read snapshot");
                     egui::ScrollArea::both()
                         .id_salt("snapshot-hex")
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: false,
+                            ..Default::default()
+                        })
                         .auto_shrink([false, false])
                         .show(&mut columns[0], |ui| {
-                            for (row, bytes) in memory.chunks(16).enumerate() {
-                                let hex = bytes
-                                    .iter()
-                                    .map(|byte| format!("{byte:02X}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" ");
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(format!("{:04X}: {hex}", row * 16))
-                                            .monospace(),
-                                    )
-                                    .wrap_mode(egui::TextWrapMode::Extend),
-                                );
-                            }
+                            snapshot_view(
+                                ui,
+                                "snapshot-hex-selection",
+                                &SnapshotText::hex(memory.as_slice()),
+                                &mut self.snapshot_selection,
+                                false,
+                            );
                         });
                     columns[1].heading("Readable string");
                     egui::ScrollArea::vertical()
                         .id_salt("snapshot-text")
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            drag: false,
+                            ..Default::default()
+                        })
                         .auto_shrink([false, false])
                         .show(&mut columns[1], |ui| {
                             match text_preview(
@@ -610,8 +789,14 @@ impl CardApp {
                                 &self.preview_address,
                                 &self.preview_length,
                             ) {
-                                Ok(text) => {
-                                    ui.add(egui::Label::new(text).wrap());
+                                Ok((address, text)) => {
+                                    snapshot_view(
+                                        ui,
+                                        ("snapshot-text-selection", address, text.len()),
+                                        &SnapshotText::readable(address, text),
+                                        &mut self.snapshot_selection,
+                                        true,
+                                    );
                                 }
                                 Err(error) => {
                                     ui.colored_label(egui::Color32::RED, error.to_string());
@@ -924,7 +1109,7 @@ mod tests {
     #[test]
     fn previews_require_explicit_valid_ranges_and_utf8() {
         let memory = [b'H', b'i', 0xFF];
-        assert_eq!(text_preview(&memory, "0", "2").unwrap(), "Hi");
+        assert_eq!(text_preview(&memory, "0", "2").unwrap(), (0, "Hi"));
         for (address, length) in [
             ("0", "3"),
             ("0", "0"),
@@ -934,6 +1119,284 @@ mod tests {
             ("FFFFFFFFFFFFFFFF", "2"),
         ] {
             assert!(text_preview(&memory, address, length).is_err());
+        }
+    }
+
+    #[test]
+    fn snapshot_selection_maps_hex_digits_and_utf8_to_byte_addresses() {
+        let hex = SnapshotText::hex(&[0x41; 32]);
+        assert_eq!(hex.selected_bytes(0..6), None);
+        assert_eq!(hex.selected_bytes(6..7), Some(0..1));
+        assert_eq!(hex.selected_bytes(7..8), Some(0..1));
+        assert_eq!(hex.selected_bytes(8..9), None);
+        assert_eq!(hex.selected_bytes(7..11), Some(0..2));
+        let next_row = hex.text.find('\n').unwrap() + 1;
+        assert_eq!(hex.selected_bytes(51..next_row + 8), Some(15..17));
+        assert_eq!(hex.selected_bytes(6..6), None);
+
+        let text = SnapshotText::readable(0x20, "A\u{20AC}\n\u{1F600}Z");
+        assert_eq!(text.selected_bytes(1..2), Some(0x21..0x24));
+        assert_eq!(text.selected_bytes(2..4), Some(0x24..0x29));
+        assert_eq!(text.selected_bytes(0..5), Some(0x20..0x2A));
+        assert_eq!(text.selected_bytes(3..3), None);
+    }
+
+    #[test]
+    fn snapshot_layout_highlights_corresponding_bytes_in_both_views() {
+        let selection = 1..4;
+        let highlight = egui::Color32::BLUE;
+        let text = SnapshotText::readable(0, "A\u{20AC}Z");
+        let hex = SnapshotText::hex("A\u{20AC}Z".as_bytes());
+        let highlighted = |snapshot: &SnapshotText| {
+            let job = snapshot.layout(
+                egui::FontId::monospace(14.0),
+                egui::Color32::WHITE,
+                highlight,
+                Some(&selection),
+                f32::INFINITY,
+            );
+            job.sections
+                .iter()
+                .filter(|section| section.format.background == highlight)
+                .map(|section| &job.text[section.byte_range.clone()])
+                .collect::<String>()
+        };
+        assert_eq!(highlighted(&text), "\u{20AC}");
+        assert_eq!(highlighted(&hex), "E282AC");
+    }
+
+    #[test]
+    fn clearing_snapshot_discards_linked_selection() {
+        let mut app = CardApp {
+            memory: Some(Box::new([0; MEMORY_SIZE])),
+            snapshot_selection: Some(0x20..0x25),
+            ..Default::default()
+        };
+        app.clear_snapshot();
+        assert!(app.snapshot_selection.is_none());
+    }
+
+    #[test]
+    fn snapshot_mouse_selection_links_both_directions_and_supports_copy() {
+        fn render(
+            ctx: &egui::Context,
+            snapshots: &[SnapshotText; 2],
+            selection: &mut Option<Range<usize>>,
+            events: Vec<egui::Event>,
+        ) -> (egui::FullOutput, Vec<egui::text_edit::TextEditOutput>) {
+            let mut views = Vec::new();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 400.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.columns(2, |columns| {
+                            for index in 0..2 {
+                                let scroll = if index == 0 {
+                                    egui::ScrollArea::both()
+                                } else {
+                                    egui::ScrollArea::vertical()
+                                };
+                                views.push(
+                                    scroll
+                                        .id_salt(index)
+                                        .scroll_source(egui::scroll_area::ScrollSource {
+                                            drag: false,
+                                            ..Default::default()
+                                        })
+                                        .show(&mut columns[index], |ui| {
+                                            snapshot_view(
+                                                ui,
+                                                index,
+                                                &snapshots[index],
+                                                selection,
+                                                index == 1,
+                                            )
+                                        })
+                                        .inner,
+                                );
+                            }
+                        });
+                    });
+                },
+            );
+            (output, views)
+        }
+
+        for (source, characters, expected_copy) in [(0, 9..17, "E2 82 AC"), (1, 1..2, "\u{20AC}")] {
+            let ctx = egui::Context::default();
+            let snapshots = [
+                SnapshotText::hex("A\u{20AC}Z".as_bytes()),
+                SnapshotText::readable(0, "A\u{20AC}Z"),
+            ];
+            let mut selection = None;
+            render(&ctx, &snapshots, &mut selection, Vec::new());
+            let (_, views) = render(&ctx, &snapshots, &mut selection, Vec::new());
+            assert!(views.iter().all(|view| view.response.rect.is_finite()));
+            let position = |index| {
+                views[source].galley_pos
+                    + views[source]
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(index))
+                        .center()
+                        .to_vec2()
+            };
+            let start = position(characters.start);
+            let end = position(characters.end);
+            render(
+                &ctx,
+                &snapshots,
+                &mut selection,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            render(
+                &ctx,
+                &snapshots,
+                &mut selection,
+                vec![egui::Event::PointerMoved(end)],
+            );
+            render(
+                &ctx,
+                &snapshots,
+                &mut selection,
+                vec![egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+            );
+            assert_eq!(selection, Some(1..4), "Source panel {source}");
+            let (output, views) = render(&ctx, &snapshots, &mut selection, vec![egui::Event::Copy]);
+            assert!(output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == expected_copy)
+            }));
+            for (index, view) in views.iter().enumerate() {
+                assert!(
+                    view.galley.job.sections.iter().any(|section| {
+                        section.format.background == ctx.style().visuals.selection.bg_fill
+                    }),
+                    "Source {source}, panel {index}, selection {selection:?}, cursor {:?}",
+                    view.cursor_range
+                );
+            }
+            let (_, views) = render(
+                &ctx,
+                &snapshots,
+                &mut selection,
+                vec![egui::Event::Text("overwrite".to_owned())],
+            );
+            assert_eq!(views[0].galley.job.text, snapshots[0].text);
+            assert_eq!(views[1].galley.job.text, snapshots[1].text);
+        }
+
+        for (index, address, expected_copy) in [
+            (6, 0, "41"),
+            (7, 0, "41"),
+            (9, 1, "E2"),
+            (10, 1, "E2"),
+            (12, 2, "82"),
+            (13, 2, "82"),
+            (15, 3, "AC"),
+            (16, 3, "AC"),
+            (18, 4, "5A"),
+            (19, 4, "5A"),
+        ] {
+            for fraction in [0.25, 0.75] {
+                let ctx = egui::Context::default();
+                let snapshots = [
+                    SnapshotText::hex("A\u{20AC}Z".as_bytes()),
+                    SnapshotText::readable(0, "A\u{20AC}Z"),
+                ];
+                let mut selection = None;
+                render(&ctx, &snapshots, &mut selection, Vec::new());
+                let (_, views) = render(&ctx, &snapshots, &mut selection, Vec::new());
+                let start = views[0]
+                    .galley
+                    .pos_from_cursor(egui::text::CCursor::new(index))
+                    .center();
+                let end = views[0]
+                    .galley
+                    .pos_from_cursor(egui::text::CCursor::new(index + 1))
+                    .center();
+                let position = views[0].galley_pos + start.lerp(end, fraction).to_vec2();
+                for pressed in [true, false] {
+                    render(
+                        &ctx,
+                        &snapshots,
+                        &mut selection,
+                        vec![
+                            egui::Event::PointerMoved(position),
+                            egui::Event::PointerButton {
+                                pos: position,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                    );
+                }
+                assert_eq!(
+                    selection,
+                    Some(address..address + 1),
+                    "Digit {index}, fraction {fraction}"
+                );
+                let (output, views) =
+                    render(&ctx, &snapshots, &mut selection, vec![egui::Event::Copy]);
+                assert!(output.platform_output.commands.iter().any(|command| {
+                    matches!(command, egui::OutputCommand::CopyText(text) if text == expected_copy)
+                }));
+                let highlighted_text = views[1]
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .filter(|section| {
+                        section.format.background == ctx.style().visuals.selection.bg_fill
+                    })
+                    .map(|section| &views[1].galley.job.text[section.byte_range.clone()])
+                    .collect::<String>();
+                assert_eq!(
+                    highlighted_text,
+                    match address {
+                        0 => "A",
+                        4 => "Z",
+                        _ => "\u{20AC}",
+                    }
+                );
+                for index in [0, 4, 5, 8, 11, 14, 17] {
+                    let start = views[0]
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(index))
+                        .center();
+                    let end = views[0]
+                        .galley
+                        .pos_from_cursor(egui::text::CCursor::new(index + 1))
+                        .center();
+                    assert!(
+                        snapshots[0]
+                            .clicked_hex_characters(
+                                &views[0].galley,
+                                start.lerp(end, 0.5).to_vec2()
+                            )
+                            .is_none()
+                    );
+                }
+            }
         }
     }
 

@@ -154,7 +154,10 @@ window. Field labels, status/errors, and destructive-write confirmation remain.
    bytes as hex in **Read snapshot**. The **Readable string** panel to its right
    displays UTF-8 text for an explicit hex address and decimal byte length.
    Both panels scroll independently; invalid UTF-8 is reported, not silently
-   replaced.
+   replaced. Click either digit of a hex byte to select the whole byte and
+   highlight its corresponding text on the right. Drag to select text or hex
+   digits to highlight the corresponding bytes in both panels. Selections can
+   be copied with Ctrl+C; both views are read-only.
 3. For writing, enter the hex address and choose **UTF-8 text** or **Hex bytes**.
    The GUI shows the encoded byte count and available space. At address `0020`,
    at most 989 bytes fit; multibyte UTF-8 characters use more than one byte.
