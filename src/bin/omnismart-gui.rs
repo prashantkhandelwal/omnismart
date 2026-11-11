@@ -54,6 +54,7 @@ enum Operation {
         reader: CString,
         aid: Option<Vec<u8>>,
         show_pan: bool,
+        raw_dump: bool,
     },
     Write(WriteJob),
 }
@@ -62,7 +63,14 @@ enum Output {
     Readers(Vec<CString>),
     Memory(Box<[u8; MEMORY_SIZE]>),
     Emv(String),
-    Written { address: u32, length: usize },
+    EmvDump {
+        report: String,
+        error: Option<String>,
+    },
+    Written {
+        address: u32,
+        length: usize,
+    },
 }
 
 fn execute(operation: Operation) -> io::Result<Output> {
@@ -75,12 +83,17 @@ fn execute(operation: Operation) -> io::Result<Output> {
             reader,
             aid,
             show_pan,
+            raw_dump,
         } => {
             let context = ReaderContext::establish()?;
             let mut card = context.connect(&reader)?;
-            let report =
-                card.with_transaction(|transmit| emv_report(transmit, aid.as_deref(), show_pan))?;
-            Ok(Output::Emv(report))
+            card.with_transaction(|transmit| {
+                if raw_dump {
+                    emv_dump_report(transmit, aid.as_deref())
+                } else {
+                    emv_report(transmit, aid.as_deref(), show_pan).map(Output::Emv)
+                }
+            })
         }
         Operation::Write(job) => {
             SynchronousApi::load(&job.dll)?.write(&job.reader, &job.request, job.pin)?;
@@ -100,6 +113,19 @@ fn emv_report(
     let mut buffer = Vec::new();
     emv::read_information_to(transmit, aid, show_pan, &mut buffer)?;
     String::from_utf8(buffer).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn emv_dump_report(
+    transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    aid: Option<&[u8]>,
+) -> io::Result<Output> {
+    let mut buffer = Vec::new();
+    let error = emv::read_dump_to(transmit, aid, &mut buffer)
+        .err()
+        .map(|error| error.to_string());
+    let report = String::from_utf8(buffer)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(Output::EmvDump { report, error })
 }
 
 fn write_request(address: &str, data: &str, encoding: Encoding) -> io::Result<WriteRequest> {
@@ -320,6 +346,7 @@ fn snapshot_view(
 
 struct CardApp {
     show_pan: bool,
+    raw_dump: bool,
     mode: CardMode,
     aid: String,
     emv: Option<String>,
@@ -360,6 +387,7 @@ impl Default for CardApp {
         };
         Self {
             show_pan: false,
+            raw_dump: false,
             mode: CardMode::Sle4428,
             aid: String::new(),
             emv: None,
@@ -414,6 +442,7 @@ impl CardApp {
             CardMode::Emv => Ok(Operation::ReadEmv {
                 reader: self.reader()?,
                 show_pan: self.show_pan,
+                raw_dump: self.raw_dump,
                 aid: if self.aid.trim().is_empty() {
                     None
                 } else {
@@ -437,10 +466,20 @@ impl CardApp {
         }
     }
 
+    fn set_raw_dump(&mut self, raw_dump: bool) {
+        if self.raw_dump != raw_dump {
+            self.raw_dump = raw_dump;
+            self.clear_snapshot();
+            self.error = None;
+            self.status = "Click Read EMV to apply raw dump visibility.".to_owned();
+        }
+    }
+
     fn change_mode(&mut self, mode: CardMode) {
         if self.mode != mode {
             self.mode = mode;
             self.show_pan = false;
+            self.raw_dump = false;
             self.clear_snapshot();
             self.pin.clear();
             self.status.clear();
@@ -503,6 +542,15 @@ impl CardApp {
             Ok(Output::Emv(report)) => {
                 self.emv = Some(report);
                 self.status = "EMV read complete.".to_owned();
+            }
+            Ok(Output::EmvDump { report, error }) => {
+                self.status = if error.is_some() {
+                    "EMV raw dump incomplete.".to_owned()
+                } else {
+                    "EMV raw dump complete.".to_owned()
+                };
+                self.emv = Some(report);
+                self.error = error;
             }
             Ok(Output::Written { address, length }) => {
                 self.status = format!("Write verified: {length} bytes at {address:04X}.");
@@ -594,9 +642,23 @@ impl CardApp {
                         }
                     });
                     let mut show_pan = self.show_pan;
-                    ui.checkbox(&mut show_pan, "Show full PAN");
+                    ui.add_enabled(
+                        !self.raw_dump,
+                        egui::Checkbox::new(&mut show_pan, "Show full PAN"),
+                    );
                     self.set_show_pan(show_pan);
-                    if self.show_pan {
+                    let mut raw_dump = self.raw_dump;
+                    ui.checkbox(&mut raw_dump, "Raw dump");
+                    self.set_raw_dump(raw_dump);
+                    if self.raw_dump {
+                        ui.colored_label(
+                            egui::Color32::RED,
+                            "Raw dump may expose full PAN, Track 2, and other sensitive data. Keep private.",
+                        );
+                        ui.small(
+                            "Advertised readable records only; protected/unadvertised memory is excluded.",
+                        );
+                    } else if self.show_pan {
                         ui.colored_label(
                             egui::Color32::RED,
                             "Full PAN enabled. Keep the display private.",
@@ -745,7 +807,11 @@ impl CardApp {
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(report) = &self.emv {
-                ui.heading("EMV information");
+                ui.heading(if self.raw_dump {
+                    "EMV raw dump"
+                } else {
+                    "EMV information"
+                });
                 egui::ScrollArea::both()
                     .id_salt("emv-information")
                     .auto_shrink([false, false])
@@ -1008,6 +1074,84 @@ mod tests {
     }
 
     #[test]
+    fn raw_dump_is_opt_in_and_toggling_discards_results_without_reading() {
+        let mut app = CardApp {
+            mode: CardMode::Emv,
+            readers: vec![CString::new("Synthetic reader").unwrap()],
+            selected: Some(0),
+            emv: Some(synthetic_emv_report(false)),
+            ..Default::default()
+        };
+        assert!(!app.raw_dump);
+        assert!(matches!(
+            app.read_operation().unwrap(),
+            Operation::ReadEmv {
+                raw_dump: false,
+                ..
+            }
+        ));
+        app.set_raw_dump(true);
+        assert!(app.emv.is_none());
+        assert!(app.worker.is_none());
+        assert!(app.status.contains("Read EMV"));
+        assert!(matches!(
+            app.read_operation().unwrap(),
+            Operation::ReadEmv { raw_dump: true, .. }
+        ));
+        app.emv = Some("Synthetic raw output".to_owned());
+        app.error = Some("Synthetic incomplete dump".to_owned());
+        app.set_raw_dump(false);
+        assert!(app.emv.is_none());
+        assert!(app.error.is_none());
+        assert!(app.worker.is_none());
+        app.set_raw_dump(true);
+        app.change_mode(CardMode::Sle4428);
+        assert!(!app.raw_dump);
+        app.change_mode(CardMode::Emv);
+        assert!(!app.raw_dump);
+    }
+
+    #[test]
+    fn raw_dump_worker_displays_complete_and_partial_reads_with_explicit_status() {
+        for fail in [false, true] {
+            let mut responses =
+                vec![vec![0x6F, 0, 0x90, 0], vec![0x80, 2, 0, 0, 0x90, 0]].into_iter();
+            let output = emv_dump_report(
+                |_| {
+                    if fail {
+                        Err(io::Error::other("Synthetic raw failure"))
+                    } else {
+                        Ok(responses.next().unwrap())
+                    }
+                },
+                Some(&[0xA0, 0, 0, 0, 3]),
+            )
+            .unwrap();
+            let (sender, receiver) = mpsc::channel();
+            let mut app = CardApp {
+                mode: CardMode::Emv,
+                raw_dump: true,
+                worker: Some(receiver),
+                ..Default::default()
+            };
+            sender.send(Ok(output)).unwrap();
+            app.poll();
+            assert!(app.worker.is_none());
+            assert_eq!(app.error.is_some(), fail);
+            let report = app.emv.as_ref().unwrap();
+            if fail {
+                assert!(report.contains("Synthetic raw failure"));
+                assert!(report.contains("INCOMPLETE"));
+                assert!(app.status.contains("incomplete"));
+            } else {
+                assert!(report.contains("R-APDU: 6F 00 90 00"));
+                assert!(report.contains("Raw EMV dump complete."));
+                assert_eq!(app.status, "EMV raw dump complete.");
+            }
+        }
+    }
+
+    #[test]
     fn emv_worker_output_is_masked_and_errors_clear_it() {
         let report = synthetic_emv_report(false);
         assert!(report.contains("Card number (masked)"));
@@ -1064,6 +1208,7 @@ mod tests {
         for label in [
             "AID (hex, optional)",
             "Show full PAN",
+            "Raw dump",
             "Read EMV",
             "EMV information",
             "Synthetic EMV information",
@@ -1079,6 +1224,53 @@ mod tests {
             assert!(!labels.contains(&label), "Unexpected {label}");
         }
         assert!(app.worker.is_none());
+    }
+
+    #[test]
+    fn raw_dump_ui_shows_opt_in_warning_and_raw_report_only_in_emv_mode() {
+        let mut app = CardApp {
+            mode: CardMode::Emv,
+            raw_dump: true,
+            emv: Some("Synthetic raw APDU output".to_owned()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 1400.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input.clone(), |ctx| app.ui(ctx));
+        let output = ctx.run(input.clone(), |ctx| app.ui(ctx));
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some(text.galley.job.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for label in ["Raw dump", "EMV raw dump", "Synthetic raw APDU output"] {
+            assert!(labels.contains(&label), "Missing {label}");
+        }
+        assert!(labels.iter().any(|label| label.contains("Track 2")));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("protected/unadvertised"))
+        );
+        assert!(!labels.contains(&"EMV information"));
+        assert!(app.worker.is_none());
+        app.change_mode(CardMode::Sle4428);
+        let output = ctx.run(input, |ctx| app.ui(ctx));
+        assert!(!output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "Raw dump")
+        }));
     }
 
     #[test]

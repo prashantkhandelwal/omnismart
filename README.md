@@ -202,10 +202,23 @@ shown as not provided. **Show full PAN** is unchecked by default; check it and
 click **Read EMV** to explicitly display the full card number if the card provides
 one. Changing the checkbox clears the current result; read again to apply the
 new setting. Switching card modes resets it to unchecked. Track 2 and raw APDU
-responses are never displayed. Keep full PAN output private.
+responses are not displayed in the normal information view. Keep full PAN
+output private.
+
+Check **Raw dump**, then click **Read EMV** to display the raw commands and
+responses for payment directories, selected applications, GPO, and all
+AFL-advertised records (SFI 1-30), including proprietary records. This is not a
+full-memory dump: protected and unadvertised data cannot be read. Raw output may
+include full PANs, Track 2, and other sensitive data regardless of **Show full
+PAN** (disabled while raw dump is enabled). Keep the display private. Partial
+reads remain visible and are explicitly marked incomplete with their error.
+Toggling **Raw dump** clears the current result; click **Read EMV** again to
+apply the setting. The checkbox defaults to unchecked and resets when changing
+card modes. No dump is saved to disk.
 
 This mode sends SELECT, GET PROCESSING OPTIONS (GPO), and advertised standard
-READ RECORD commands. GPO may affect card counters; no PIN verification,
+READ RECORD commands (including advertised proprietary records in raw mode).
+GPO may affect card counters; no PIN verification,
 payment authorization, or card-write commands are sent. Applications requiring
 nonempty PDOL terminal data are not supported and produce an explicit error.
 Nothing is read automatically when switching modes. Keep the display private:

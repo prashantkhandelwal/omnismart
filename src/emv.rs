@@ -8,6 +8,7 @@
 //! [`read_application_information`] after selecting a documented application, or
 //! decode existing TLV bytes with [`CardInformation::from_tlv`]. For silent
 //! discovery and reading, use [`read_card_information`].
+//! [`read_dump_to`] writes an explicitly opted-in raw dump without console output.
 
 use std::io::{self, Write};
 
@@ -203,6 +204,7 @@ pub fn read_directory(
         },
         explicit_aid,
         ReadMode::Directory,
+        true,
     )
 }
 
@@ -216,7 +218,7 @@ pub fn read_information(
     transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     explicit_aid: Option<&[u8]>,
 ) -> io::Result<()> {
-    read_applications(transmit, explicit_aid, ReadMode::Information)
+    read_applications(transmit, explicit_aid, ReadMode::Information, true)
 }
 
 /// Explicitly opts in to printing the full PAN returned in EMV tag 5A.
@@ -227,7 +229,7 @@ pub fn read_information_with_pan(
     transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     explicit_aid: Option<&[u8]>,
 ) -> io::Result<()> {
-    read_applications(transmit, explicit_aid, ReadMode::InformationWithPan)
+    read_applications(transmit, explicit_aid, ReadMode::InformationWithPan, true)
 }
 
 /// Explicitly reads an unmasked PAN from a documented payment application.
@@ -288,7 +290,62 @@ pub fn read_dump(
     transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     explicit_aid: Option<&[u8]>,
 ) -> io::Result<()> {
-    read_applications(transmit, explicit_aid, ReadMode::Dump)
+    read_applications(transmit, explicit_aid, ReadMode::Dump, true)
+}
+
+/// Writes raw commands and responses for all readable, advertised EMV records.
+///
+/// Explicit opt-in is required: output may expose full PANs and Track 2 data.
+/// Reads directories, selected applications, GPO, and advertised records (SFI 1-30).
+/// This is not a full-memory dump; protected/unadvertised data are excluded.
+/// GPO may affect card counters. Nonempty PDOLs are unsupported.
+/// No console output is produced. On failure, partial output is retained in
+/// `output`, marked incomplete, and the error is returned to the caller.
+pub fn read_dump_to(
+    mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    explicit_aid: Option<&[u8]>,
+    output: &mut impl Write,
+) -> io::Result<()> {
+    fn write_hex(output: &mut impl Write, label: &str, bytes: &[u8]) -> io::Result<()> {
+        write!(output, "{label}")?;
+        for byte in bytes {
+            write!(output, " {byte:02X}")?;
+        }
+        writeln!(output)
+    }
+
+    writeln!(
+        output,
+        "Raw EMV dump\n\
+         WARNING: May contain full PAN, Track 2, and other sensitive data. Keep private.\n\
+         Scope: Payment directories, selected applications, GPO, and AFL-advertised \
+         records (SFI 1-30).\n\
+         Not a full-memory dump: protected and unadvertised data are excluded.\n"
+    )?;
+    let result = read_applications(
+        |command| {
+            write_hex(output, "C-APDU:", command)?;
+            match transmit(command) {
+                Ok(response) => {
+                    write_hex(output, "R-APDU:", &response)?;
+                    writeln!(output)?;
+                    Ok(response)
+                }
+                Err(error) => {
+                    writeln!(output, "Transport error: {error}")?;
+                    Err(error)
+                }
+            }
+        },
+        explicit_aid,
+        ReadMode::Dump,
+        false,
+    );
+    match &result {
+        Ok(()) => writeln!(output, "Raw EMV dump complete.")?,
+        Err(error) => writeln!(output, "Raw EMV dump INCOMPLETE: {error}")?,
+    }
+    result
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -358,16 +415,19 @@ fn read_applications(
     mut transmit: impl FnMut(&[u8]) -> io::Result<Vec<u8>>,
     explicit_aid: Option<&[u8]>,
     mode: ReadMode,
+    report_progress: bool,
 ) -> io::Result<()> {
     let aids = if let Some(aid) = explicit_aid {
         validate_aid(aid)?;
         vec![aid.to_vec()]
     } else {
-        discover_aids(&mut transmit, true)?
+        discover_aids(&mut transmit, report_progress)?
     };
     let mut errors = Vec::new();
     for aid in aids {
-        print_hex("Selecting application AID:", &aid);
+        if report_progress {
+            print_hex("Selecting application AID:", &aid);
+        }
         let result = (|| {
             let response = select(&mut transmit, &aid)?;
             require_success(&response, "Application SELECT")?;
@@ -396,7 +456,9 @@ fn read_applications(
             if mode != ReadMode::Dump {
                 return Err(error);
             }
-            eprintln!("Application dump incomplete: {error}");
+            if report_progress {
+                eprintln!("Application dump incomplete: {error}");
+            }
             errors.push(error.to_string());
         }
     }
@@ -1333,6 +1395,90 @@ mod tests {
         .unwrap();
         assert_eq!(commands.len(), 3);
         assert_eq!(commands[2], [0, 0xB2, 1, 0x5C, 0]);
+    }
+
+    #[test]
+    fn raw_dump_writer_includes_discovery_continuations_and_all_advertised_records() {
+        let mut responses = vec![
+            vec![0x6A, 0x82],
+            vec![0x6F, 7, 0x4F, 5, 0xA0, 0, 0, 0, 1, 0x90, 0],
+            vec![0x61, 2],
+            vec![0x6F, 0, 0x90, 0],
+            vec![0x80, 10, 0, 0, 8, 1, 1, 0, 88, 1, 1, 0, 0x90, 0],
+            vec![0x70, 6, 0x5A, 4, 0x12, 0x34, 0x56, 0x78, 0x90, 0],
+            vec![0xDE, 0xAD, 0xBE, 0xEF, 0x90, 0],
+        ]
+        .into_iter();
+        let mut output = Vec::new();
+        read_dump_to(|_| Ok(responses.next().unwrap()), None, &mut output).unwrap();
+        assert!(responses.next().is_none());
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("C-APDU:").count(), 7);
+        assert_eq!(output.matches("R-APDU:").count(), 7);
+        for expected in [
+            "C-APDU: 00 A4 04 00 0E 31 50 41 59 2E 53 59 53 2E 44 44 46 30 31 00",
+            "C-APDU: 00 A4 04 00 0E 32 50 41 59 2E 53 59 53 2E 44 44 46 30 31 00",
+            "C-APDU: 00 C0 00 00 02",
+            "C-APDU: 80 A8 00 00 02 83 00 00",
+            "C-APDU: 00 B2 01 0C 00",
+            "C-APDU: 00 B2 01 5C 00",
+            "R-APDU: 70 06 5A 04 12 34 56 78 90 00",
+            "R-APDU: DE AD BE EF 90 00",
+            "Not a full-memory dump",
+            "Raw EMV dump complete.",
+        ] {
+            assert!(output.contains(expected), "Missing {expected}");
+        }
+    }
+
+    #[test]
+    fn raw_dump_writer_preserves_partial_data_and_transport_errors() {
+        let mut calls = 0;
+        let mut output = Vec::new();
+        let error = read_dump_to(
+            |_| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(vec![0x6F, 0, 0x90, 0])
+                } else {
+                    Err(io::Error::other("Synthetic disconnection"))
+                }
+            },
+            Some(&[0xA0, 0, 0, 0, 1]),
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Synthetic disconnection"));
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("R-APDU: 6F 00 90 00"));
+        assert!(output.contains("Transport error: Synthetic disconnection"));
+        assert!(output.contains("Raw EMV dump INCOMPLETE:"));
+        assert!(!output.contains("Raw EMV dump complete."));
+    }
+
+    #[test]
+    fn raw_dump_writer_continues_after_status_failure_and_marks_incomplete() {
+        let mut responses = vec![
+            vec![0x6F, 0, 0x90, 0],
+            vec![0x80, 6, 0, 0, 8, 1, 2, 0, 0x90, 0],
+            vec![0x69, 0x82],
+            vec![0x70, 0, 0x90, 0],
+        ]
+        .into_iter();
+        let mut output = Vec::new();
+        read_dump_to(
+            |_| Ok(responses.next().unwrap()),
+            Some(&[0xA0, 0, 0, 0, 1]),
+            &mut output,
+        )
+        .unwrap_err();
+        assert!(responses.next().is_none());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("R-APDU: 69 82"));
+        assert!(output.contains("C-APDU: 00 B2 02 0C 00"));
+        assert!(output.contains("R-APDU: 70 00 90 00"));
+        assert!(output.contains("Raw EMV dump INCOMPLETE:"));
+        assert!(!output.contains("Raw EMV dump complete."));
     }
 
     #[test]
